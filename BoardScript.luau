@@ -1,0 +1,925 @@
+---------------------------------------------------------------------
+-- REFERENCES
+---------------------------------------------------------------------
+local board = script.Parent
+local gui = board.Parent
+
+local topBar = gui:WaitForChild("TopBar")
+local timerLabel = topBar:WaitForChild("TimerLabel")
+local movesLabel = topBar:WaitForChild("MovesLabel")
+local sizeLabel = topBar:WaitForChild("SizeLabel")
+local BestTimeLabel = topBar:WaitForChild("BestTimeLabel")
+local LeastAmountofMovesLabel = topBar:WaitForChild("LeastAmountofMovesLabel")
+
+local settingsFrame = gui:WaitForChild("SettingsFrame")
+local rowsValue = settingsFrame:WaitForChild("PuzzleRows")
+local colsValue = settingsFrame:WaitForChild("PuzzleColumns")
+local slidingModeValue = settingsFrame:WaitForChild("SlidingModeEnabled")
+local colorpatternMode = settingsFrame:WaitForChild("ColorPatternMode")
+
+local puzzleModeValue = settingsFrame:WaitForChild("PuzzleMode")         
+local selectedImageIdValue = settingsFrame:WaitForChild("SelectedImageID") 
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local bestTimeEvent = ReplicatedStorage:WaitForChild("BestTimeEvent")
+local puzzleCompletedEvent = ReplicatedStorage:WaitForChild("PuzzleCompleted")
+local savedBestTimes = {}
+local LeastMovesEvent = ReplicatedStorage:WaitForChild("LeastMovesEvent")
+local savedBestMoves = {}
+local slidingUsedThisPuzzle = false
+local Statistics = gui:waitForChild("StatisticsFrame")
+local statisticsSize = Statistics:WaitForChild("StatisticsSizeLabel")
+local leaderboard = gui:WaitForChild("LeaderboardFrame")
+local leaderboardSize = leaderboard:WaitForChild("LeaderboardSizeLabel")
+---------------------------------------------------------------------
+-- VARIABLES
+---------------------------------------------------------------------
+local tileOrder = {}
+local tileIndex = {}        -- tile ? current index
+local correctIndexMap = {}  -- tile ? solved index
+local emptyIndex = 0
+local tileGrid = {}   -- tileGrid[row][col] = tile
+local tileRC = {}     -- tileRC[tile] = {row, col}
+local timerRunning = false
+local elapsedTime = 0
+local moves = 0
+local inputLocked = true
+
+---------------------------------------------------------------------
+-- TIMER FUNCTIONS
+---------------------------------------------------------------------
+local function stopTimer()
+	timerRunning = false
+end
+
+local function startTimer()
+	if timerRunning then return end
+	timerRunning = true
+
+	task.spawn(function()
+		local last = os.clock()
+
+		while timerRunning do
+			local now = os.clock()
+			local dt = now - last
+			last = now
+
+			elapsedTime += dt
+
+			local totalSeconds = math.floor(elapsedTime)
+			local minutes = math.floor(totalSeconds / 60)
+			local seconds = totalSeconds % 60
+			local centiseconds = math.floor((elapsedTime - totalSeconds) * 100)
+
+			timerLabel.Text = string.format("Time: %d:%02d.%02d", minutes, seconds, centiseconds)
+
+			task.wait(0.01)
+		end
+	end)
+end
+
+local function findEmptyIndex()
+	for i, tile in ipairs(tileOrder) do
+		if correctIndexMap[tile] == #tileOrder then
+			return i
+		end
+	end
+end
+---------------------------------------------------------------------
+-- TILE LOCK / UNLOCK
+---------------------------------------------------------------------
+local function lockTiles()
+	for _, tile in ipairs(tileOrder) do
+		tile.Active = false
+		tile.AutoButtonColor = false
+	end
+end
+
+local function unlockTiles()
+	for _, tile in ipairs(tileOrder) do
+		tile.Active = true
+		tile.AutoButtonColor = false
+	end
+end
+
+---------------------------------------------------------------------
+-- COLOR FUNCTIONS
+---------------------------------------------------------------------
+local function getRowColor(row, totalRows)
+	local hue = (row - 1) / totalRows
+	return Color3.fromHSV(hue, 0.6, 1)
+end
+local function getColumnColor(col, totalCols)
+	local hue = (col - 1) / totalCols
+	return Color3.fromHSV(hue, 0.6, 1)
+end
+
+local function assignFringeColors(rows, cols)
+	local tileColors = {}
+	local colorIndex = 1
+
+	local squareSize = math.min(rows, cols)
+
+	-- Helper to color a single tile
+	local function setTile(r, c, color)
+		local index = (r - 1) * cols + c
+		if not tileColors[index] then
+			tileColors[index] = color
+		end
+	end
+
+	--------------------------------------------------------------------
+	-- CASE 1: TALL PUZZLE (rows > cols)
+	--------------------------------------------------------------------
+	if rows > cols then
+		local offset = rows - squareSize  -- number of leftover rows at top
+
+		-- 1. Fill leftover TOP rows with row colors
+		for r = 1, offset do
+			local rowColor = getRowColor(colorIndex, rows * 2)
+			colorIndex += 1
+
+			for c = 1, cols do
+				setTile(r, c, rowColor)
+			end
+		end
+
+		-- 2. Apply fringe colors to the bottom square
+		for k = 1, squareSize do
+			local rTop = offset + k
+
+			-- Row color for ring k
+			local rowColor = getRowColor(colorIndex, rows * 2)
+			colorIndex += 1
+
+			for c = k, cols do
+				setTile(rTop, c, rowColor)
+			end
+
+			-- Column color for ring k
+			local colColor = getColumnColor(colorIndex, cols * 2)
+			colorIndex += 1
+
+			for r = rTop + 1, rows do
+				setTile(r, k, colColor)
+			end
+		end
+
+		return tileColors
+	end
+
+	--------------------------------------------------------------------
+	-- CASE 2: WIDE PUZZLE (cols > rows)
+	--------------------------------------------------------------------
+	if cols > rows then
+		local offset = cols - squareSize  -- leftover columns on left
+
+		-- 1. Fill leftover LEFT columns with column colors
+		for c = 1, offset do
+			local colColor = getColumnColor(colorIndex, cols * 2)
+			colorIndex += 1
+
+			for r = 1, rows do
+				setTile(r, c, colColor)
+			end
+		end
+
+		-- 2. Apply fringe colors to the right square
+		for k = 1, squareSize do
+			local cLeft = offset + k
+
+			-- Row color for ring k
+			local rowColor = getRowColor(colorIndex, rows * 2)
+			colorIndex += 1
+
+			for c = cLeft, cols do
+				setTile(k, c, rowColor)
+			end
+
+			-- Column color for ring k
+			local colColor = getColumnColor(colorIndex, cols * 2)
+			colorIndex += 1
+
+			for r = k + 1, rows do
+				setTile(r, cLeft, colColor)
+			end
+		end
+
+		return tileColors
+	end
+
+	--------------------------------------------------------------------
+	-- CASE 3: PERFECT SQUARE (rows == cols)
+	--------------------------------------------------------------------
+	for k = 1, squareSize do
+		-- Row color
+		local rowColor = getRowColor(colorIndex, rows * 2)
+		colorIndex += 1
+
+		for c = k, cols do
+			setTile(k, c, rowColor)
+		end
+
+		-- Column color
+		local colColor = getColumnColor(colorIndex, cols * 2)
+		colorIndex += 1
+
+		for r = k + 1, rows do
+			setTile(r, k, colColor)
+		end
+	end
+
+	return tileColors
+end
+---------------------------------------------------------------------
+-- PUZZLE HELPERS
+---------------------------------------------------------------------
+slidingModeValue.Changed:Connect(function(newValue)
+	if newValue == true then
+		slidingUsedThisPuzzle = true
+	end
+end)
+local function indexToRC(index, cols)
+	local row = math.ceil(index / cols)
+	local col = (index - 1) % cols + 1
+	return row, col
+end
+
+local function sameRow(i1, i2, cols)
+	return math.ceil(i1 / cols) == math.ceil(i2 / cols)
+end
+
+local function sameColumn(i1, i2, cols)
+	return ((i1 - 1) % cols) == ((i2 - 1) % cols)
+end
+
+local function isAdjacent(i1, i2, cols)
+	local r1, c1 = indexToRC(i1, cols)
+	local r2, c2 = indexToRC(i2, cols)
+	return (math.abs(r1 - r2) + math.abs(c1 - c2)) == 1
+end
+
+local function swapTilesLogical(i1, i2)
+	local t1 = tileOrder[i1]
+	local t2 = tileOrder[i2]
+
+	-- Swap in 1D list
+	tileOrder[i1], tileOrder[i2] = t2, t1
+
+	-- Update index lookup
+	tileIndex[t1] = i2
+	tileIndex[t2] = i1
+
+	-- Convert to row/col
+	local r1, c1 = indexToRC(i1, colsValue.Value)
+	local r2, c2 = indexToRC(i2, colsValue.Value)
+
+	-- Swap in 2D grid
+	tileGrid[r1][c1], tileGrid[r2][c2] = tileGrid[r2][c2], tileGrid[r1][c1]
+
+	-- Swap reverse row/col lookup
+	tileRC[t1], tileRC[t2] = tileRC[t2], tileRC[t1]
+end
+local function applyLayoutOrders()
+	for i, tile in ipairs(tileOrder) do
+		tile.LayoutOrder = i
+	end
+end
+local function slideTiles(clickedIndex, emptyIndex, cols)
+	local direction = clickedIndex > emptyIndex and 1 or -1
+	local step = sameRow(clickedIndex, emptyIndex, cols) and 1 or cols
+
+	local current = emptyIndex
+	local swaps = {}
+
+	while current ~= clickedIndex do
+		local nextIndex = current + step * direction
+		table.insert(swaps, {from = current, to = nextIndex})
+		current = nextIndex
+	end
+
+	-- Perform logical swaps only
+	for _, s in ipairs(swaps) do
+		swapTilesLogical(s.from, s.to)
+	end
+
+	-- Apply LayoutOrder ONCE
+	applyLayoutOrders()
+
+	return math.abs(clickedIndex - emptyIndex) / step
+end
+local function getTileIndex(tile)
+	return tileIndex[tile]
+end
+
+local function isSolved(rows, cols)
+	local total = rows * cols
+	for i = total - 1, 1, -1 do
+		if correctIndexMap[tileOrder[i]] ~= i then
+			return false
+		end
+	end
+	return true
+end
+local function getValidMoves(emptyIndex, rows, cols)
+	local moves = {}
+	local r, c = indexToRC(emptyIndex, cols)
+
+	if r > 1 then table.insert(moves, emptyIndex - cols) end
+	if r < rows then table.insert(moves, emptyIndex + cols) end
+	if c > 1 then table.insert(moves, emptyIndex - 1) end
+	if c < cols then table.insert(moves, emptyIndex + 1) end
+
+	return moves
+end
+local function getPuzzleScale(sizeName)
+	if sizeName == "100%" then
+		return 0.90
+	elseif sizeName == "90%" then
+		return 0.80
+	elseif sizeName == "80%" then
+		return 0.70
+	elseif sizeName == "70%" then
+		return 0.60
+	elseif sizeName == "60%" then
+		return 0.50
+	elseif sizeName == "50%" then
+		return 0.40
+	elseif sizeName == "40%" then
+		return 0.30
+	end
+	return 0.90 -- fallback
+end
+local function getTextPaddingScale(sizeName)
+	if sizeName == "100%" then
+		return 0
+	elseif sizeName == "75%" then
+		return 0.125
+	elseif sizeName == "50%" then
+		return 0.25
+	elseif sizeName == "25%" then
+		return 0.375
+	end
+	return 0
+end
+local function rebuildGridFromOrder(rows, cols)
+	tileGrid = {}
+	tileRC = {}
+
+	for i, tile in ipairs(tileOrder) do
+		local row, col = indexToRC(i, cols)
+		tileGrid[row] = tileGrid[row] or {}
+		tileGrid[row][col] = tile
+		tileRC[tile] = {row, col}
+		tileIndex[tile] = i
+	end
+end
+---------------------------------------------------------------------
+-- PROCESS TILE
+---------------------------------------------------------------------
+local function processTile(tile)
+	if inputLocked then return end
+
+	local rows = rowsValue.Value
+	local cols = colsValue.Value
+	local index = getTileIndex(tile)
+	if not index then return end
+
+	-- NEW: allow row/column sliding
+	local canSlide = false
+
+	if sameRow(index, emptyIndex, cols) then
+		canSlide = true
+	elseif sameColumn(index, emptyIndex, cols) then
+		canSlide = true
+	end
+
+	if not canSlide then return end
+
+	-- Slide all tiles between clicked tile and blank
+	local moved = slideTiles(index, emptyIndex, cols)
+
+	-- Update empty index
+	emptyIndex = index
+
+	-- Add correct number of moves
+	moves += moved
+	movesLabel.Text = "Moves: " .. moves
+	if not timerRunning and moves > 0 then
+		startTimer()
+	end
+	-- Check solved
+	if isSolved(rows, cols) then
+		stopTimer()
+		inputLocked = true
+		lockTiles()
+
+		puzzleCompletedEvent:FireServer(
+			rows,
+			cols,
+			elapsedTime,
+			moves,
+			slidingUsedThisPuzzle,
+			puzzleModeValue.Value
+		)
+	end
+end
+
+------
+---best time saves
+--------
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local bestTimeEvent = ReplicatedStorage:WaitForChild("BestTimeEvent")
+
+local function formatTime(t)
+	if not t then
+		return "Best Time: --:--.--"
+	end
+
+	local totalSeconds = math.floor(t)
+	local minutes = math.floor(totalSeconds / 60)
+	local seconds = totalSeconds % 60
+	local centi = math.floor((t - totalSeconds) * 100)
+
+	return string.format("Best Time: %d:%02d.%02d", minutes, seconds, centi)
+end
+local function formatMoves(m)
+	if not m then
+		return "Least Moves: --"
+	end
+	return "Least Moves: " .. m
+end
+
+bestTimeEvent.OnClientEvent:Connect(function(allTimes)
+	savedBestTimes = allTimes or {}
+
+	local rows = rowsValue.Value
+	local cols = colsValue.Value
+	local key = tostring(rows) .. "x" .. tostring(cols)
+
+	BestTimeLabel.Text = formatTime(savedBestTimes[key])
+end)
+LeastMovesEvent.OnClientEvent:Connect(function(allMoves)
+	savedBestMoves = allMoves or {}
+
+	local rows = rowsValue.Value
+	local cols = colsValue.Value
+	local key = tostring(rows) .. "x" .. tostring(cols)
+
+	LeastAmountofMovesLabel.Text = formatMoves(savedBestMoves[key])
+end)
+---------------------------------------------------------------------
+-- BUILD PUZZLE (RESPONSIVE + IMAGE SUPPORT)
+---------------------------------------------------------------------
+local function buildPuzzle(rows, cols)
+	-- Reset old data
+	for _, child in ipairs(board:GetChildren()) do
+		if child:IsA("TextButton") then
+			child:Destroy()
+		end
+	end
+
+	tileOrder = {}
+	tileIndex = {}
+	correctIndexMap = {}
+	tileGrid = {}
+	tileRC = {}
+
+	local totalTiles = rows * cols
+
+	---------------------------------------------------------------------
+	-- PUZZLE SIZE CALCULATION
+	---------------------------------------------------------------------
+	local camera = workspace.CurrentCamera
+	local screenH = camera.ViewportSize.Y
+
+	local scale = getPuzzleScale(settingsFrame.PuzzleSize.Value)
+	local baseSize = screenH * scale
+
+	local puzzleW, puzzleH
+
+	if rows == cols then
+		puzzleW, puzzleH = baseSize, baseSize
+	elseif cols > rows then
+		puzzleW = baseSize
+		puzzleH = baseSize * (rows / cols)
+	else
+		puzzleH = baseSize
+		puzzleW = baseSize * (cols / rows)
+	end
+
+	puzzleW = math.floor(puzzleW / cols) * cols
+	puzzleH = math.floor(puzzleH / rows) * rows
+
+	board.Size = UDim2.fromOffset(puzzleW, puzzleH)
+
+	---------------------------------------------------------------------
+	-- COLOR PATTERN PRECALC
+	---------------------------------------------------------------------
+	local fringeColors = {}
+	if colorpatternMode.Value == "Fringe" then
+		fringeColors = assignFringeColors(rows, cols)
+	end
+
+	local textPaddingScale = getTextPaddingScale(settingsFrame.TextSize.Value)
+
+	---------------------------------------------------------------------
+	-- TILE CREATION
+	---------------------------------------------------------------------
+	for i = 1, totalTiles do
+		local tile = Instance.new("TextButton")
+		tile.Name = "Tile" .. i
+		tile.Parent = board
+		tile.LayoutOrder = i
+		tile.TextScaled = true
+		tile.Font = Enum.Font.GothamBold
+		tile.BorderSizePixel = 0
+		tile.AutoButtonColor = false
+
+		-- 1D index ? row/col
+		local row = math.ceil(i / cols)
+		local col = ((i - 1) % cols) + 1
+
+		-- Fill 2D grid
+		tileGrid[row] = tileGrid[row] or {}
+		tileGrid[row][col] = tile
+
+		-- Reverse lookup
+		tileRC[tile] = {row, col}
+
+		-- Solved position
+		correctIndexMap[tile] = i
+		tileOrder[i] = tile
+		tileIndex[tile] = i
+
+		-----------------------------------------------------------------
+		-- BLANK TILE
+		-----------------------------------------------------------------
+		if i == totalTiles then
+			tile.Text = ""
+			tile.BackgroundTransparency = 1
+			tile.Active = false
+
+			-----------------------------------------------------------------
+			-- NUMBER MODE
+			-----------------------------------------------------------------
+		elseif puzzleModeValue.Value == "Numbers" then
+			tile.Text = tostring(i)
+
+			local padding = Instance.new("UIPadding")
+			padding.Parent = tile
+			padding.PaddingTop = UDim.new(textPaddingScale, 0)
+			padding.PaddingBottom = UDim.new(textPaddingScale, 0)
+			padding.PaddingLeft = UDim.new(textPaddingScale, 0)
+			padding.PaddingRight = UDim.new(textPaddingScale, 0)
+
+			local mode = colorpatternMode.Value
+			if mode == "Rows" then
+				tile.BackgroundColor3 = getRowColor(row, rows)
+			elseif mode == "Columns" then
+				tile.BackgroundColor3 = getColumnColor(col, cols)
+			elseif mode == "Fringe" then
+				tile.BackgroundColor3 = fringeColors[i]
+			else
+				tile.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+			end
+
+			-----------------------------------------------------------------
+			-- IMAGE MODE
+			-----------------------------------------------------------------
+		elseif puzzleModeValue.Value == "Images"
+			and selectedImageIdValue.Value ~= "" then
+
+			tile.Text = ""
+			tile.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+
+			local img = Instance.new("ImageLabel")
+			img.Parent = tile
+			img.Size = UDim2.fromScale(1, 1)
+			img.BackgroundTransparency = 1
+			img.BorderSizePixel = 0
+			img.Active = false
+			img.Image = "rbxassetid://" .. selectedImageIdValue.Value
+
+			local sliceW = 1024 / cols
+			local sliceH = 1024 / rows
+
+			img.ImageRectSize = Vector2.new(sliceW, sliceH)
+			img.ImageRectOffset = Vector2.new(
+				(col - 1) * sliceW,
+				(row - 1) * sliceH
+			)
+		end
+
+		-- Square tiles
+		local aspect = Instance.new("UIAspectRatioConstraint")
+		aspect.AspectRatio = 1
+		aspect.Parent = tile
+	end
+
+	---------------------------------------------------------------------
+	-- EMPTY TILE INDEX
+	---------------------------------------------------------------------
+	emptyIndex = findEmptyIndex()
+
+	---------------------------------------------------------------------
+	-- GRID LAYOUT
+	---------------------------------------------------------------------
+	local grid = board:FindFirstChildOfClass("UIGridLayout")
+	if not grid then
+		grid = Instance.new("UIGridLayout")
+		grid.Parent = board
+	end
+
+	grid.FillDirection = Enum.FillDirection.Horizontal
+	grid.HorizontalAlignment = Enum.HorizontalAlignment.Center
+	grid.VerticalAlignment = Enum.VerticalAlignment.Center
+	grid.SortOrder = Enum.SortOrder.LayoutOrder
+	grid.CellPadding = UDim2.new(0, 0, 0, 0)
+	grid.CellSize = UDim2.new(1 / cols, 0, 1 / rows, 0)
+
+	---------------------------------------------------------------------
+	-- INPUT EVENTS
+	---------------------------------------------------------------------
+	for _, tile in ipairs(tileOrder) do
+		tile.MouseButton1Click:Connect(function()
+			if slidingModeValue.Value then return end
+			processTile(tile)
+		end)
+
+		tile.MouseEnter:Connect(function()
+			if not slidingModeValue.Value then return end
+			processTile(tile)
+		end)
+	end
+
+	lockTiles()
+end
+
+
+---------------------------------------------------------------------
+-- SHUFFLE
+---------------------------------------------------------------------
+local function shuffle2x2()
+	emptyIndex = findEmptyIndex()
+
+	local moveCount = 20
+	for i = 1, moveCount do
+		local moves = getValidMoves(emptyIndex, 2, 2)
+		local target = moves[math.random(1, #moves)]
+
+		swapTilesLogical(emptyIndex, target)
+		emptyIndex = target
+	end
+
+	rebuildGridFromOrder(2, 2)
+
+	--THIS is what updates the UI
+	applyLayoutOrders()
+end
+
+local function shufflePuzzle(rows, cols)
+	local totalTiles = rows * cols
+	inputLocked = true
+	stopTimer()
+
+	elapsedTime = 0
+	timerLabel.Text = "Time: 0:00.00"
+	moves = 0
+	movesLabel.Text = "Moves: 0"
+
+	unlockTiles()
+	slidingUsedThisPuzzle = slidingModeValue.Value
+
+	-- Special 2×2 case
+	if rows == 2 and cols == 2 then
+		shuffle2x2()
+		task.wait()
+		table.sort(tileOrder, function(a, b)
+			return a.LayoutOrder < b.LayoutOrder
+		end)
+		emptyIndex = findEmptyIndex()
+		inputLocked = false
+		return
+	end
+
+	-- NORMAL SCRAMBLE (Python algorithm converted)
+	local n = rows
+	local g = totalTiles - 1
+	local rng = Random.new()
+
+	-- Build tile list 1..g (blank excluded)
+	local arr = {}
+	for i = 1, g do
+		arr[i] = i
+	end
+
+	-- Parity tracking
+	local parity = false
+
+	-- Fisher–Yates variant with parity tracking
+	for i = 1, g - 2 do
+		local t = rng:NextInteger(i, g)
+		if i ~= t then
+			parity = not parity
+		end
+		arr[i], arr[t] = arr[t], arr[i]
+	end
+
+	-- Fix parity if needed
+	if parity then
+		arr[g - 1], arr[g] = arr[g], arr[g - 1]
+	end
+
+	-- Append blank tile
+	table.insert(arr, totalTiles)
+
+	-- Random blank movement (vertical then horizontal)
+	local d = rng:NextInteger(0, rows - 1)
+	local r = rng:NextInteger(0, cols - 1)
+	local blankIndex = totalTiles
+
+	-- Move blank UP d times
+	for _ = 1, d do
+		arr[blankIndex], arr[blankIndex - cols] = arr[blankIndex - cols], arr[blankIndex]
+		blankIndex -= cols
+	end
+
+	-- Move blank LEFT r times
+	for _ = 1, r do
+		arr[blankIndex], arr[blankIndex - 1] = arr[blankIndex - 1], arr[blankIndex]
+		blankIndex -= 1
+	end
+
+	-- Apply LayoutOrder to tiles
+	for pos = 1, totalTiles do
+		local tileValue = arr[pos]
+		local tile = board:FindFirstChild("Tile" .. tileValue)
+		tile.LayoutOrder = pos
+	end
+
+	-- Rebuild tileOrder from LayoutOrder
+	table.sort(tileOrder, function(a, b)
+		return a.LayoutOrder < b.LayoutOrder
+	end)
+
+	-- Rebuild indices + grid
+	rebuildGridFromOrder(rows, cols)
+
+	emptyIndex = findEmptyIndex()
+	inputLocked = false
+end
+
+
+---------------------------------------------------------------------
+-- UPDATE COLORS WHEN SETTING CHANGES
+---------------------------------------------------------------------
+colorpatternMode.Changed:Connect(function()
+	local rows = rowsValue.Value
+	local cols = colsValue.Value
+	local mode = colorpatternMode.Value
+
+	-- Precompute fringe colors if needed
+	local fringeColors = nil
+	if mode == "Fringe" then
+		fringeColors = assignFringeColors(rows, cols)
+	end
+
+	for _, tile in ipairs(tileOrder) do
+		if tile.Text ~= "" then
+			local correct = correctIndexMap[tile]
+			local row = math.ceil(correct / cols)
+			local col = ((correct - 1) % cols) + 1
+
+			if mode == "Rows" then
+				tile.BackgroundColor3 = getRowColor(row, rows)
+			elseif mode == "Columns" then
+				tile.BackgroundColor3 = getColumnColor(col, cols)
+			elseif mode == "Fringe" then
+				tile.BackgroundColor3 = fringeColors[correct] or Color3.fromRGB(255,255,255)
+			else
+				tile.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+			end
+		end
+	end
+end)
+---------------------------------------------------------------------
+-- REBUILD PUZZLE WHEN SETTINGS CHANGE
+---------------------------------------------------------------------
+local function rebuild()
+	-- Wait briefly for mobile rotation to finish
+	task.wait(0.25)
+
+	-- Wait until screen size stops changing
+	local lastSize = gui.AbsoluteSize
+	for i = 1, 20 do
+		task.wait(0.05)
+		if gui.AbsoluteSize == lastSize then
+			break
+		end
+		lastSize = gui.AbsoluteSize
+	end
+
+	local rows = rowsValue.Value
+	local cols = colsValue.Value
+
+	buildPuzzle(rows, cols)
+
+	inputLocked = true
+	timerRunning = false
+	elapsedTime = 0
+	moves = 0
+
+	timerLabel.Text = "Time: 0:00.00"
+	movesLabel.Text = "Moves: 0"
+	sizeLabel.Text = "Size: " .. rows .. "x" .. cols
+	statisticsSize.Text =  rows .. "x" .. cols
+	leaderboardSize.Text =  rows .. "x" .. cols
+	local key = tostring(rows) .. "x" .. tostring(cols)
+	BestTimeLabel.Text = formatTime(savedBestTimes[key])
+	LeastAmountofMovesLabel.Text = formatMoves(savedBestMoves[key])
+end
+
+rowsValue.Changed:Connect(rebuild)
+colsValue.Changed:Connect(rebuild)
+puzzleModeValue.Changed:Connect(rebuild)
+selectedImageIdValue.Changed:Connect(rebuild)
+
+-- Rebuild puzzle when screen orientation / size changes
+local function relayoutPuzzle()
+	task.wait(0.05)
+
+	local rows = rowsValue.Value
+	local cols = colsValue.Value
+
+	local camera = workspace.CurrentCamera
+	local viewport = camera.ViewportSize
+	local screenH = viewport.Y
+
+	-- Read setting
+	local scale = getPuzzleScale(settingsFrame.PuzzleSize.Value)
+	local baseSize = screenH * scale
+
+	local puzzleW
+	local puzzleH
+
+	if rows == cols then
+		puzzleW = baseSize
+		puzzleH = baseSize
+	elseif cols > rows then
+		puzzleW = baseSize
+		puzzleH = baseSize * (rows / cols)
+	else
+		puzzleH = baseSize
+		puzzleW = baseSize * (cols / rows)
+	end
+
+	puzzleW = math.floor(puzzleW / cols) * cols
+	puzzleH = math.floor(puzzleH / rows) * rows
+
+	board.Size = UDim2.fromOffset(puzzleW, puzzleH)
+
+	local tileWidth = puzzleW / cols
+	local tileHeight = puzzleH / rows
+
+	-- NEW: read padding scale
+	local textPaddingScale = getTextPaddingScale(settingsFrame.TextSize.Value)
+
+	for _, tile in ipairs(board:GetChildren()) do
+		if tile:IsA("TextButton") then
+			local index = tile.LayoutOrder
+			local isImageTile = (tile.Text == "" and tile:FindFirstChildOfClass("ImageLabel") ~= nil)
+
+			if not isImageTile then
+				-- NUMBER TILE ? update padding
+				local padding = tile:FindFirstChildOfClass("UIPadding")
+				if not padding then
+					padding = Instance.new("UIPadding")
+					padding.Parent = tile
+				end
+
+				padding.PaddingTop = UDim.new(textPaddingScale, 0)
+				padding.PaddingBottom = UDim.new(textPaddingScale, 0)
+				padding.PaddingLeft = UDim.new(textPaddingScale, 0)
+				padding.PaddingRight = UDim.new(textPaddingScale, 0)
+			else
+				-- IMAGE TILE ? ensure NO padding exists
+				local padding = tile:FindFirstChildOfClass("UIPadding")
+				if padding then padding:Destroy() end
+			end
+		end
+	end
+end
+
+gui:GetPropertyChangedSignal("AbsoluteSize"):Connect(relayoutPuzzle)
+settingsFrame.PuzzleSize.Changed:Connect(relayoutPuzzle)
+settingsFrame.TextSize.Changed:Connect(relayoutPuzzle)
+---------------------------------------------------------------------
+-- INITIALIZE
+---------------------------------------------------------------------
+rebuild()
+
+local shuffleEvent = gui:WaitForChild("ShuffleEvent")
+shuffleEvent.Event:Connect(function()
+	shufflePuzzle(rowsValue.Value, colsValue.Value)
+end)
