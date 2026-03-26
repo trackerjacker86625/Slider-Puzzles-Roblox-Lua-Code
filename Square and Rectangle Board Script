@@ -691,7 +691,7 @@ local function shufflePuzzle(rows, cols)
 	unlockTiles()
 	slidingUsedThisPuzzle = slidingModeValue.Value
 
-	-- Special 2×2 case
+	-- Special 2Ã—2 case
 	if rows == 2 and cols == 2 then
 		shuffle2x2()
 		task.wait()
@@ -717,7 +717,7 @@ local function shufflePuzzle(rows, cols)
 	-- Parity tracking
 	local parity = false
 
-	-- Fisher–Yates variant with parity tracking
+	-- FisherÂ–Yates variant with parity tracking
 	for i = 1, g - 2 do
 		local t = rng:NextInteger(i, g)
 		if i ~= t then
