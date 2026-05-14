@@ -18,6 +18,7 @@ local slidingModeValue = settingsFrame:WaitForChild("SlidingModeEnabled")
 local colorpatternMode = settingsFrame:WaitForChild("ColorPatternMode")
 local puzzleModeValue = settingsFrame:WaitForChild("PuzzleMode")
 local selectedImageIdValue = settingsFrame:WaitForChild("SelectedImageID")
+local blindfoldedModeValue = settingsFrame:WaitForChild("BlindfoldedModeEnabled")
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local bestTimeEvent = ReplicatedStorage:WaitForChild("CircleBestTimeEvent")
@@ -32,7 +33,7 @@ local leaderboardSize = leaderboard:WaitForChild("LeaderboardSizeLabel")
 
 local savedBestTimes = {}
 local savedBestMoves = {}
-local slidingUsedThisPuzzle = false
+local blindfoldActive = false
 
 ------------------------
 -- VARIABLES
@@ -159,7 +160,7 @@ local function generateCircleMask(vDiam, hDiam)
 		end
 	end
 
-	-- SPECIAL CASE: 4�4 circle only
+	-- SPECIAL CASE: 4×4 circle only
 	if vDiam == 4 and hDiam == 4 then
 		mask = {
 			{false, true,  true,  false},
@@ -168,7 +169,7 @@ local function generateCircleMask(vDiam, hDiam)
 			{false, true,  true,  false},
 		}
 	else
-		-- ORIGINAL LOGIC FOR 5�5 AND LARGER
+		-- ORIGINAL LOGIC FOR 5×5 AND LARGER
 		local midR = math.floor((vDiam + 1) / 2)
 		local midC = math.floor((hDiam + 1) / 2)
 
@@ -267,14 +268,6 @@ local function generateCircleMask(vDiam, hDiam)
 
 	return mask
 end
----------------------------------------------------------------------
--- SLIDING MODE FLAG
----------------------------------------------------------------------
-slidingModeValue.Changed:Connect(function()
-	if slidingModeValue.Value == true then
-		slidingUsedThisPuzzle = true
-	end
-end)
 
 ---------------------------------------------------------------------
 -- PUZZLE HELPERS
@@ -419,6 +412,10 @@ local function solvedRCFromIndex(index, vDiam, hDiam)
 		end
 	end
 end
+local function isRealBlank(tile)
+	return correctIndexMap[tile] == #tileOrder
+end
+
 -----------------------
 -- FORMATTING HELPERS
 -----------------------
@@ -484,6 +481,34 @@ local function processTile(tile)
 	if not timerRunning and moves > 0 then
 		startTimer()
 	end
+	if blindfoldedModeValue.Value and moves == moved and moved > 0 then
+		blindfoldActive = true
+		for _, tile in ipairs(tileOrder) do
+
+			-- REAL blank tile (circle puzzle blank must stay visible + white)
+			if correctIndexMap[tile] == #tileOrder then
+				tile.Text = ""
+				tile.BackgroundTransparency = 0
+				tile.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+
+				local img = tile:FindFirstChildOfClass("ImageLabel")
+				if img then img:Destroy() end
+
+				continue
+			end
+
+			-- NON-BLANK TILES → apply blindfold
+			tile.Text = ""
+
+			local img = tile:FindFirstChildOfClass("ImageLabel")
+			if img then img:Destroy() end
+
+			tile.BackgroundColor3 = Color3.fromRGB(255, 93, 93)
+			tile.BorderMode = Enum.BorderMode.Inset
+			tile.BorderSizePixel = 1
+			tile.BorderColor3 = Color3.fromRGB(0, 0, 0)
+		end
+	end
 
 	if isSolved() then
 		stopTimer()
@@ -495,7 +520,7 @@ local function processTile(tile)
 			h,
 			elapsedTime,
 			moves,
-			slidingUsedThisPuzzle,
+			blindfoldedModeValue.Value,
 			puzzleModeValue.Value
 		)
 	end
@@ -651,9 +676,13 @@ local function buildCirclePuzzle(vDiam, hDiam)
 
 	-- INPUT EVENTS
 	for _, tile in ipairs(tileOrder) do
-		tile.MouseButton1Click:Connect(function()
-			if slidingModeValue.Value then return end
-			processTile(tile)
+		tile.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
+
+				if slidingModeValue.Value then return end
+				processTile(tile)
+			end
 		end)
 
 		tile.MouseEnter:Connect(function()
@@ -663,6 +692,90 @@ local function buildCirclePuzzle(vDiam, hDiam)
 	end
 
 	lockTiles()
+end
+
+local function restoreBlindfold()
+	if not blindfoldActive then
+		return -- nothing to restore
+	end
+	local rows = vDiamValue.Value
+	local cols = hDiamValue.Value
+
+	for _, tile in ipairs(tileOrder) do
+
+		-- REAL BLANK TILE (logic-based, not visual)
+		if isRealBlank(tile) then
+			-- ensure it looks blank
+			tile.Text = ""
+			tile.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+			tile.BorderSizePixel = 0
+
+			continue
+		end
+
+		-- Get row/col for this tile
+		local correct = correctIndexMap[tile]
+		local row = math.ceil(correct / cols)
+		local col = ((correct - 1) % cols) + 1
+
+		------------------------------------------------------------------
+		-- RESTORE TEXT (NUMBER MODE)
+		------------------------------------------------------------------
+		if puzzleModeValue.Value == "Numbers" then
+			local num = tonumber(tile.Name:match("%d+"))
+			tile.Text = tostring(num)
+		else
+			tile.Text = ""
+		end
+
+		------------------------------------------------------------------
+		-- RESTORE IMAGE (IMAGE MODE)
+		------------------------------------------------------------------
+		if puzzleModeValue.Value == "Images" and selectedImageIdValue.Value ~= "" then
+			local img = tile:FindFirstChildOfClass("ImageLabel")
+			if not img then
+				img = Instance.new("ImageLabel")
+				img.Parent = tile
+				img.Size = UDim2.fromScale(1, 1)
+				img.BackgroundTransparency = 1
+				img.BorderSizePixel = 0
+				img.Active = false
+			end
+
+			img.Image = "rbxassetid://" .. selectedImageIdValue.Value
+			img.ScaleType = Enum.ScaleType.Crop
+
+			local sliceW = 1024 / cols
+			local sliceH = 1024 / rows
+
+			img.ImageRectSize = Vector2.new(sliceW, sliceH)
+			img.ImageRectOffset = Vector2.new(
+				(col - 1) * sliceW,
+				(row - 1) * sliceH
+			)
+		else
+			local img = tile:FindFirstChildOfClass("ImageLabel")
+			if img then img:Destroy() end
+		end
+		------------------------------------------------------------------
+		-- RESTORE BACKGROUND COLOR
+		------------------------------------------------------------------
+		local mode = colorpatternMode.Value
+		local solvedIndex = correctIndexMap[tile]
+		local sr, sc = solvedRCFromIndex(solvedIndex, rows, cols)
+
+		if mode == "Rows" then
+			tile.BackgroundColor3 = getRowColor(sr, rows)
+		elseif mode == "Columns" then
+			tile.BackgroundColor3 = getColumnColor(sc, cols)
+		else
+			tile.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+		end
+
+		tile.BackgroundTransparency = 0
+		tile.BorderSizePixel = 0
+	end
+	blindfoldActive = false
 end
 
 ---------------------------------------------------------------------
@@ -742,10 +855,10 @@ local function isReachableState(vDiam, hDiam)
 		end
 	end
 
-	-- Convert blankIndex ? current (r,c)
+	-- Convert blankIndex → current (r,c)
 	local blankR, blankC = solvedRCFromIndex(blankIndex, vDiam, hDiam)
 
-	-- Convert solved index ? goal (r,c)
+	-- Convert solved index → goal (r,c)
 	local goalIndex = correctIndexMap[blankTile]
 	local goalR, goalC = solvedRCFromIndex(goalIndex, vDiam, hDiam)
 
@@ -776,14 +889,13 @@ end
 local function shuffleCirclePuzzle(vDiam, hDiam)
 	inputLocked = true
 	stopTimer()
-
+	restoreBlindfold()
 	elapsedTime = 0
 	timerLabel.Text = "Time: 0:00.00"
 	moves = 0
 	movesLabel.Text = "Moves: 0"
 
 	unlockTiles()
-	slidingUsedThisPuzzle = slidingModeValue.Value
 
 	resetTileOrderToSolved()
 
@@ -876,7 +988,7 @@ vDiamValue.Changed:Connect(rebuild)
 hDiamValue.Changed:Connect(rebuild)
 puzzleModeValue.Changed:Connect(rebuild)
 selectedImageIdValue.Changed:Connect(rebuild)
-
+blindfoldedModeValue.Changed:Connect(rebuild)
 gui:GetPropertyChangedSignal("Enabled"):Connect(function()
 	if gui.Enabled == false then
 		rebuild()
@@ -901,10 +1013,11 @@ local function relayoutPuzzle()
 	-- Compute tile size based on largest dimension
 	local maxDiam = math.max(v, h)
 	local tileSize = math.floor(baseSize / maxDiam)
-	local boardSize = tileSize * maxDiam
 
-	-- Resize board
-	board.Size = UDim2.fromOffset(boardSize, boardSize)
+	local boardW = tileSize * h
+	local boardH = tileSize * v
+
+	board.Size = UDim2.fromOffset(boardW, boardH)
 
 	-- Update globals
 	TILE_WIDTH = tileSize
@@ -933,7 +1046,7 @@ local function relayoutPuzzle()
 		local isImageTile = (tile.Text == "" and tile:FindFirstChildOfClass("ImageLabel") ~= nil)
 
 		if not isImageTile then
-			-- NUMBER TILE ? ensure padding exists
+			-- NUMBER TILE → ensure padding exists
 			local padding = tile:FindFirstChildOfClass("UIPadding")
 			if not padding then
 				padding = Instance.new("UIPadding")
@@ -946,7 +1059,7 @@ local function relayoutPuzzle()
 			padding.PaddingRight = UDim.new(textPaddingScale, 0)
 
 		else
-			-- IMAGE TILE ? remove padding
+			-- IMAGE TILE → remove padding
 			local padding = tile:FindFirstChildOfClass("UIPadding")
 			if padding then padding:Destroy() end
 		end
@@ -967,3 +1080,27 @@ local shuffleEvent = gui:WaitForChild("CircleShuffleEvent")
 shuffleEvent.Event:Connect(function()
 	shuffleCirclePuzzle(vDiamValue.Value, hDiamValue.Value)
 end)
+
+
+scrapped circle generator. produces a more accurate circle on larger puzzles rather than a diamond. I do not like the generation for smaller puzzles.
+local function generateCircleMask(rows, cols)
+    local mask = {}
+
+    local cx = (cols + 1) / 2
+    local cy = (rows + 1) / 2
+    local rx = cols / 2
+    local ry = rows / 2
+
+    for r = 1, rows do
+        mask[r] = {}
+        for c = 1, cols do
+            local dx = (c - cx) / rx
+            local dy = (r - cy) / ry
+            local dist = dx*dx + dy*dy
+
+            mask[r][c] = (dist <= 1)
+        end
+    end
+
+    return mask
+end
