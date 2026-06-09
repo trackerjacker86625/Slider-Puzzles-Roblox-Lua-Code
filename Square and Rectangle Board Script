@@ -808,7 +808,6 @@ local function rebuild()
 	LeastAmountofMovesLabel.Text = formatMoves(savedBestMoves[key])
 end
 
-blindfoldedModeValue.Changed:Connect(rebuild)
 rowsValue.Changed:Connect(rebuild)
 colsValue.Changed:Connect(rebuild)
 puzzleModeValue.Changed:Connect(rebuild)
@@ -948,6 +947,9 @@ shuffleEvent.Event:Connect(function()
 	local rows = rowsValue.Value
 	local cols = colsValue.Value
 
+	-- Reset blindfold state
+	blindfoldActive = false
+
 	-- Always reset timer on shuffle
 	timerRunning = false
 	elapsedTime = 0
@@ -959,4 +961,24 @@ shuffleEvent.Event:Connect(function()
 	if blindfoldedModeValue.Value then
 		startTimer()
 	end
+end)
+
+blindfoldedModeValue.Changed:Connect(function()
+	rebuild()
+
+	-- Prevent moves until the player shuffles again
+	inputLocked = true
+	lockTiles()
+
+	-- Reset blindfold state so next run hides tiles correctly
+	blindfoldActive = false
+	moves = 0
+	timerRunning = false
+	elapsedTime = 0
+	timerLabel.Text = "Time: 0:00.00"
+
+	-- DO NOT call PuzzleStart here
+	-- DO NOT start the timer here
+
+	-- Player must press Shuffle to begin a new blindfold run
 end)
