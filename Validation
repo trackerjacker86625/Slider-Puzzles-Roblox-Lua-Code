@@ -1,0 +1,282 @@
+-- ServerPuzzleController.lua (ServerScriptService)
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local DataStoreService = game:GetService("DataStoreService")
+
+-- RemoteEvents
+local PuzzleStart        = ReplicatedStorage:WaitForChild("PuzzleStart")
+local ValidatedRunEvent  = ReplicatedStorage:WaitForChild("ValidatedRunEvent")
+local PuzzleInit         = ReplicatedStorage:WaitForChild("PuzzleInit")
+local RequestSlide       = ReplicatedStorage:WaitForChild("RequestSlide")
+local SlideResult        = ReplicatedStorage:WaitForChild("SlideResult")
+
+local banStore = DataStoreService:GetDataStore("PuzzleGame_Bans")
+
+-- Active puzzle state
+local PuzzleState = require(game.ServerScriptService.ActivePuzzleModule)
+local activePuzzle = PuzzleState
+
+----------------------------------------------------
+-- AUTOBAN
+----------------------------------------------------
+local function autoban(player, reason)
+	warn("AUTOBAN:", player.Name, reason)
+
+	pcall(function()
+		banStore:SetAsync(player.UserId, {
+			reason = reason,
+			time = os.time()
+		})
+	end)
+
+	player:Kick("You have been permanently banned for cheating.\nReason: " .. reason)
+end
+
+----------------------------------------------------
+-- HELPERS
+----------------------------------------------------
+local function sameRow(i1, i2, cols)
+	return math.ceil(i1 / cols) == math.ceil(i2 / cols)
+end
+
+local function sameColumn(i1, i2, cols)
+	return ((i1 - 1) % cols) == ((i2 - 1) % cols)
+end
+
+local function isSolved(board)
+	for i = 1, #board do
+		if board[i] ~= i then
+			return false
+		end
+	end
+	return true
+end
+
+----------------------------------------------------
+-- SERVER SHUFFLE
+----------------------------------------------------
+local function generateSolvableLayout(rows, cols)
+	local totalTiles = rows * cols
+	local g = totalTiles - 1
+	local rng = Random.new()
+
+	local arr = {}
+	for i = 1, g do
+		arr[i] = i
+	end
+
+	local parity = false
+	for i = 1, g - 2 do
+		local t = rng:NextInteger(i, g)
+		if i ~= t then parity = not parity end
+		arr[i], arr[t] = arr[t], arr[i]
+	end
+
+	if parity then
+		arr[g - 1], arr[g] = arr[g], arr[g - 1]
+	end
+
+	table.insert(arr, totalTiles)
+
+	local d = rng:NextInteger(0, rows - 1)
+	local r = rng:NextInteger(0, cols - 1)
+	local blankIndex = totalTiles
+
+	for _ = 1, d do
+		arr[blankIndex], arr[blankIndex - cols] = arr[blankIndex - cols], arr[blankIndex]
+		blankIndex -= cols
+	end
+
+	for _ = 1, r do
+		arr[blankIndex], arr[blankIndex - 1] = arr[blankIndex - 1], arr[blankIndex]
+		blankIndex -= 1
+	end
+
+	return arr
+end
+
+----------------------------------------------------
+-- SLIDE LOGIC
+----------------------------------------------------
+local function computeSlide(board, clickedIndex, emptyIndex, rows, cols)
+	if clickedIndex == emptyIndex then
+		return board, emptyIndex, 0
+	end
+
+	if not (sameRow(clickedIndex, emptyIndex, cols) or sameColumn(clickedIndex, emptyIndex, cols)) then
+		return nil, nil, nil
+	end
+
+	local direction = clickedIndex > emptyIndex and 1 or -1
+	local step = sameRow(clickedIndex, emptyIndex, cols) and 1 or cols
+
+	local current = emptyIndex
+	local swaps = {}
+
+	while current ~= clickedIndex do
+		local nextIndex = current + step * direction
+		table.insert(swaps, {from = current, to = nextIndex})
+		current = nextIndex
+	end
+
+	for _, s in ipairs(swaps) do
+		board[s.from], board[s.to] = board[s.to], board[s.from]
+	end
+
+	local movedCount = math.abs(clickedIndex - emptyIndex) / step
+	return board, clickedIndex, movedCount
+end
+
+----------------------------------------------------
+-- RATE LIMITING
+----------------------------------------------------
+local lastMove = {}
+local MOVE_COOLDOWN = 0.02
+
+----------------------------------------------------
+-- PUZZLE START
+----------------------------------------------------
+PuzzleStart.OnServerEvent:Connect(function(player, rows, cols, puzzleMode, blindfoldEnabled)
+	if typeof(rows) ~= "number" or typeof(cols) ~= "number" then return end
+	if rows < 2 or cols < 2 then return end
+	if rows > 50 or cols > 50 then return end
+	if typeof(puzzleMode) ~= "string" then return end
+	if typeof(blindfoldEnabled) ~= "boolean" then return end
+
+	local layout = generateSolvableLayout(rows, cols)
+	local totalTiles = rows * cols
+
+	local emptyIndex
+	for i = 1, totalTiles do
+		if layout[i] == totalTiles then
+			emptyIndex = i
+			break
+		end
+	end
+
+	if not emptyIndex then
+		autoban(player, "No blank tile in generated layout")
+		return
+	end
+
+	activePuzzle[player] = {
+		rows = rows,
+		cols = cols,
+		mode = puzzleMode,
+		blindfold = blindfoldEnabled,
+		startTime = blindfoldEnabled and tick() or 0,
+		completed = false,
+		board = layout,
+		emptyIndex = emptyIndex,
+		moves = 0,
+	}
+
+	PuzzleInit:FireClient(player, rows, cols, layout)
+end)
+
+----------------------------------------------------
+-- REQUEST SLIDE
+----------------------------------------------------
+RequestSlide.OnServerEvent:Connect(function(player, clickedIndex)
+	local active = activePuzzle[player]
+	if not active then
+		autoban(player, "RequestSlide without active puzzle")
+		return
+	end
+
+	if active.completed then
+		return
+	end
+
+	if typeof(clickedIndex) ~= "number" then
+		autoban(player, "RequestSlide non-number index")
+		return
+	end
+
+	local rows = active.rows
+	local cols = active.cols
+	local board = active.board
+	local emptyIndex = active.emptyIndex
+	local totalTiles = rows * cols
+
+	if clickedIndex < 1 or clickedIndex > totalTiles then
+		autoban(player, "RequestSlide out-of-range index")
+		return
+	end
+
+	-- Rate limit
+	local now = tick()
+	if lastMove[player] and now - lastMove[player] < MOVE_COOLDOWN then
+		return
+	end
+	lastMove[player] = now
+
+	-- Compute slide
+	local newBoard, newEmptyIndex, movedCount =
+		computeSlide(board, clickedIndex, emptyIndex, rows, cols)
+
+	if not newBoard then
+		return
+	end
+
+	-- Start timer on first REAL move
+	if not active.blindfold and active.moves == 0 and movedCount > 0 then
+		active.startTime = tick()
+	end
+
+	active.board = newBoard
+	active.emptyIndex = newEmptyIndex
+	active.moves += movedCount
+
+	local solved = isSolved(newBoard)
+	local bypass = (totalTiles < 16)
+
+	if solved and not active.completed then
+		active.completed = true
+		active.validated = true
+
+		local solveTime = tick() - active.startTime
+		local moves = active.moves
+
+		if not bypass then
+			if solveTime < 0 then
+				autoban(player, "Negative solve time")
+				return
+			end
+			if moves < 0 then
+				autoban(player, "Negative moves")
+				return
+			end
+			if totalTiles >= 16 and solveTime < 0.25 then
+				return
+			end
+			if totalTiles >= 16 and moves < 1 then
+				return
+			end
+		end
+
+		ValidatedRunEvent:Fire(player, rows, cols, solveTime, moves, active.mode, active.blindfold)
+
+		task.defer(function()
+			activePuzzle[player] = nil
+		end)
+	end
+
+	SlideResult:FireClient(
+		player,
+		newBoard,
+		movedCount,
+		active.emptyIndex,
+		active.moves,
+		solved
+	)
+end)
+
+----------------------------------------------------
+-- CLEANUP
+----------------------------------------------------
+Players.PlayerRemoving:Connect(function(player)
+	activePuzzle[player] = nil
+	lastMove[player] = nil
+end)
