@@ -1,5 +1,3 @@
--- ServerPuzzleController.lua (ServerScriptService)
-
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 local DataStoreService = game:GetService("DataStoreService")
@@ -13,12 +11,12 @@ local SlideResult        = ReplicatedStorage:WaitForChild("SlideResult")
 
 local banStore = DataStoreService:GetDataStore("PuzzleGame_Bans")
 
--- Active puzzle state
+-- Active puzzle state (shared module table)
 local PuzzleState = require(game.ServerScriptService.ActivePuzzleModule)
 local activePuzzle = PuzzleState
 
 ----------------------------------------------------
--- AUTOBAN
+-- AUTOBAN (only for truly impossible states)
 ----------------------------------------------------
 local function autoban(player, reason)
 	warn("AUTOBAN:", player.Name, reason)
@@ -52,48 +50,98 @@ local function isSolved(board)
 	end
 	return true
 end
-
+local function countCorrectTiles(board)
+	local correct = 0
+	for i = 1, #board - 1 do
+		if board[i] == i then
+			correct += 1
+		end
+	end
+	return correct
+end
 ----------------------------------------------------
 -- SERVER SHUFFLE
 ----------------------------------------------------
+local function shuffle2x2Server()
+	local rows, cols = 2, 2
+	local totalTiles = 4
+
+	-- Start solved
+	local arr = {1, 2, 3, 4}
+	local emptyIndex = 4
+
+	-- Random walk
+	local rng = Random.new()
+	local moveCount = 20
+
+	local function getValidMoves(idx)
+		local moves = {}
+		if idx > cols then table.insert(moves, idx - cols) end
+		if idx <= totalTiles - cols then table.insert(moves, idx + cols) end
+		if (idx - 1) % cols ~= 0 then table.insert(moves, idx - 1) end
+		if idx % cols ~= 0 then table.insert(moves, idx + 1) end
+		return moves
+	end
+
+	for i = 1, moveCount do
+		local moves = getValidMoves(emptyIndex)
+		local target = moves[rng:NextInteger(1, #moves)]
+		arr[emptyIndex], arr[target] = arr[target], arr[emptyIndex]
+		emptyIndex = target
+	end
+
+	return arr
+end
+
 local function generateSolvableLayout(rows, cols)
+	if rows == 2 and cols == 2 then
+		return shuffle2x2Server()
+	end
 	local totalTiles = rows * cols
 	local g = totalTiles - 1
 	local rng = Random.new()
 
-	local arr = {}
-	for i = 1, g do
-		arr[i] = i
+	while true do
+		-- build arr normally (your existing code)
+		local arr = {}
+		for i = 1, g do arr[i] = i end
+
+		local parity = false
+		for i = 1, g - 2 do
+			local t = rng:NextInteger(i, g)
+			if i ~= t then parity = not parity end
+			arr[i], arr[t] = arr[t], arr[i]
+		end
+
+		if parity then
+			arr[g - 1], arr[g] = arr[g], arr[g - 1]
+		end
+
+		table.insert(arr, totalTiles)
+
+		-- random blank movement (your existing code)
+		local d = rng:NextInteger(0, rows - 1)
+		local r = rng:NextInteger(0, cols - 1)
+		local blankIndex = totalTiles
+
+		for _ = 1, d do
+			arr[blankIndex], arr[blankIndex - cols] = arr[blankIndex - cols], arr[blankIndex]
+			blankIndex -= cols
+		end
+
+		for _ = 1, r do
+			arr[blankIndex], arr[blankIndex - 1] = arr[blankIndex - 1], arr[blankIndex]
+			blankIndex -= 1
+		end
+
+		-- minimum scramble check
+		local correct = countCorrectTiles(arr)
+		if correct <= (totalTiles / 2) then
+			return arr
+		end
+
+		-- otherwise loop again and reshuffle
 	end
-
-	local parity = false
-	for i = 1, g - 2 do
-		local t = rng:NextInteger(i, g)
-		if i ~= t then parity = not parity end
-		arr[i], arr[t] = arr[t], arr[i]
-	end
-
-	if parity then
-		arr[g - 1], arr[g] = arr[g], arr[g - 1]
-	end
-
-	table.insert(arr, totalTiles)
-
-	local d = rng:NextInteger(0, rows - 1)
-	local r = rng:NextInteger(0, cols - 1)
-	local blankIndex = totalTiles
-
-	for _ = 1, d do
-		arr[blankIndex], arr[blankIndex - cols] = arr[blankIndex - cols], arr[blankIndex]
-		blankIndex -= cols
-	end
-
-	for _ = 1, r do
-		arr[blankIndex], arr[blankIndex - 1] = arr[blankIndex - 1], arr[blankIndex]
-		blankIndex -= 1
-	end
-
-	return arr
 end
 
 ----------------------------------------------------
@@ -138,9 +186,17 @@ local MOVE_COOLDOWN = 0.02
 -- PUZZLE START
 ----------------------------------------------------
 PuzzleStart.OnServerEvent:Connect(function(player, rows, cols, puzzleMode, blindfoldEnabled)
+	-- Basic validation
 	if typeof(rows) ~= "number" or typeof(cols) ~= "number" then return end
-	if rows < 2 or cols < 2 then return end
-	if rows > 50 or cols > 50 then return end
+	if rows < 2 or cols < 2 then
+		autoban(player, "Invalid puzzle dimensions (too small)")
+		return
+	end
+
+	if rows > 50 or cols > 50 then
+		autoban(player, "Invalid puzzle dimensions (too large)")
+		return
+	end
 	if typeof(puzzleMode) ~= "string" then return end
 	if typeof(blindfoldEnabled) ~= "boolean" then return end
 
@@ -155,11 +211,13 @@ PuzzleStart.OnServerEvent:Connect(function(player, rows, cols, puzzleMode, blind
 		end
 	end
 
+	-- This should never fail; if it does, it's server-side
 	if not emptyIndex then
-		autoban(player, "No blank tile in generated layout")
+		warn("Internal error: No blank tile in generated layout for", player.Name)
 		return
 	end
 
+	-- Overwrite any previous puzzle safely
 	activePuzzle[player] = {
 		rows = rows,
 		cols = cols,
@@ -172,6 +230,7 @@ PuzzleStart.OnServerEvent:Connect(function(player, rows, cols, puzzleMode, blind
 		moves = 0,
 	}
 
+	-- Client builds board in solved order, then applies layout
 	PuzzleInit:FireClient(player, rows, cols, layout)
 end)
 
@@ -180,17 +239,20 @@ end)
 ----------------------------------------------------
 RequestSlide.OnServerEvent:Connect(function(player, clickedIndex)
 	local active = activePuzzle[player]
+
+	-- Desync or manual firing: just ignore, do NOT autoban
 	if not active then
-		autoban(player, "RequestSlide without active puzzle")
 		return
 	end
 
+	-- Puzzle already completed: ignore further moves
 	if active.completed then
 		return
 	end
 
+	-- Basic type validation
 	if typeof(clickedIndex) ~= "number" then
-		autoban(player, "RequestSlide non-number index")
+		warn(player.Name, "sent RequestSlide with non-number index")
 		return
 	end
 
@@ -200,12 +262,13 @@ RequestSlide.OnServerEvent:Connect(function(player, clickedIndex)
 	local emptyIndex = active.emptyIndex
 	local totalTiles = rows * cols
 
+	-- Range validation
 	if clickedIndex < 1 or clickedIndex > totalTiles then
-		autoban(player, "RequestSlide out-of-range index")
+		warn(player.Name, "sent RequestSlide out-of-range index", clickedIndex)
 		return
 	end
 
-	-- Rate limit
+	-- Rate limit moves
 	local now = tick()
 	if lastMove[player] and now - lastMove[player] < MOVE_COOLDOWN then
 		return
@@ -216,11 +279,12 @@ RequestSlide.OnServerEvent:Connect(function(player, clickedIndex)
 	local newBoard, newEmptyIndex, movedCount =
 		computeSlide(board, clickedIndex, emptyIndex, rows, cols)
 
+	-- Illegal move: ignore
 	if not newBoard then
 		return
 	end
 
-	-- Start timer on first REAL move
+	-- Start timer on first REAL move (non-blindfold)
 	if not active.blindfold and active.moves == 0 and movedCount > 0 then
 		active.startTime = tick()
 	end
@@ -233,12 +297,21 @@ RequestSlide.OnServerEvent:Connect(function(player, clickedIndex)
 	local bypass = (totalTiles < 16)
 
 	if solved and not active.completed then
+		-- EXTRA SECURITY: verify board integrity before accepting solve
+		for i = 1, totalTiles do
+			if active.board[i] ~= i then
+				autoban(player, "Client reported solved but server board is not solved")
+				return
+			end
+		end
+
 		active.completed = true
 		active.validated = true
 
 		local solveTime = tick() - active.startTime
 		local moves = active.moves
 
+		-- Only autoban for truly impossible states
 		if not bypass then
 			if solveTime < 0 then
 				autoban(player, "Negative solve time")
@@ -248,21 +321,27 @@ RequestSlide.OnServerEvent:Connect(function(player, clickedIndex)
 				autoban(player, "Negative moves")
 				return
 			end
-			if totalTiles >= 16 and solveTime < 0.25 then
+			if totalTiles >= 16 and moves < 1 then
+				autoban(player, "Solved puzzle with zero moves above 16 tiles")
 				return
 			end
-			if totalTiles >= 16 and moves < 1 then
+
+			if totalTiles >= 16 and solveTime < 0.3 then
+				autoban(player, "Solve time impossibly fast")
 				return
 			end
 		end
 
+		-- Report validated run
 		ValidatedRunEvent:Fire(player, rows, cols, solveTime, moves, active.mode, active.blindfold)
 
-		task.defer(function()
+		-- Clear puzzle state after a short delay to avoid race with client
+		task.delay(0.2, function()
 			activePuzzle[player] = nil
 		end)
 	end
 
+	-- Always tell client the result of this move
 	SlideResult:FireClient(
 		player,
 		newBoard,
