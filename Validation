@@ -15,9 +15,9 @@ local banStore = DataStoreService:GetDataStore("PuzzleGame_Bans")
 local PuzzleState = require(game.ServerScriptService.ActivePuzzleModule)
 local activePuzzle = PuzzleState
 
-----------------------------------------------------
+---------------
 -- AUTOBAN (only for truly impossible states)
-----------------------------------------------------
+---------------
 local function autoban(player, reason)
 	warn("AUTOBAN:", player.Name, reason)
 
@@ -31,9 +31,9 @@ local function autoban(player, reason)
 	player:Kick("You have been permanently banned for cheating.\nReason: " .. reason)
 end
 
-----------------------------------------------------
+----------
 -- HELPERS
-----------------------------------------------------
+----------
 local function sameRow(i1, i2, cols)
 	return math.ceil(i1 / cols) == math.ceil(i2 / cols)
 end
@@ -59,9 +59,9 @@ local function countCorrectTiles(board)
 	end
 	return correct
 end
-----------------------------------------------------
+-------------
 -- SERVER SHUFFLE
-----------------------------------------------------
+-------------
 local function shuffle2x2Server()
 	local rows, cols = 2, 2
 	local totalTiles = 4
@@ -144,9 +144,9 @@ local function generateSolvableLayout(rows, cols)
 	end
 end
 
-----------------------------------------------------
+------------
 -- SLIDE LOGIC
-----------------------------------------------------
+------------
 local function computeSlide(board, clickedIndex, emptyIndex, rows, cols)
 	if clickedIndex == emptyIndex then
 		return board, emptyIndex, 0
@@ -176,15 +176,15 @@ local function computeSlide(board, clickedIndex, emptyIndex, rows, cols)
 	return board, clickedIndex, movedCount
 end
 
-----------------------------------------------------
+--------------
 -- RATE LIMITING
-----------------------------------------------------
+--------------
 local lastMove = {}
 local MOVE_COOLDOWN = 0.02
 
-----------------------------------------------------
+--------------
 -- PUZZLE START
-----------------------------------------------------
+--------------
 PuzzleStart.OnServerEvent:Connect(function(player, rows, cols, puzzleMode, blindfoldEnabled)
 	-- Basic validation
 	if typeof(rows) ~= "number" or typeof(cols) ~= "number" then return end
@@ -234,13 +234,15 @@ PuzzleStart.OnServerEvent:Connect(function(player, rows, cols, puzzleMode, blind
 	PuzzleInit:FireClient(player, rows, cols, layout)
 end)
 
-----------------------------------------------------
+------
 -- REQUEST SLIDE
-----------------------------------------------------
+------
+local HttpService = game:GetService("HttpService")
+
 RequestSlide.OnServerEvent:Connect(function(player, clickedIndex)
 	local active = activePuzzle[player]
 
-	-- Desync or manual firing: just ignore, do NOT autoban
+	-- Desync or manual firing: ignore, no autoban
 	if not active then
 		return
 	end
@@ -258,8 +260,6 @@ RequestSlide.OnServerEvent:Connect(function(player, clickedIndex)
 
 	local rows = active.rows
 	local cols = active.cols
-	local board = active.board
-	local emptyIndex = active.emptyIndex
 	local totalTiles = rows * cols
 
 	-- Range validation
@@ -268,12 +268,24 @@ RequestSlide.OnServerEvent:Connect(function(player, clickedIndex)
 		return
 	end
 
-	-- Rate limit moves
+	-- Rate limit moves (slightly safer cooldown)
 	local now = tick()
 	if lastMove[player] and now - lastMove[player] < MOVE_COOLDOWN then
 		return
 	end
 	lastMove[player] = now
+
+	-- Clone board to avoid race conditions
+	local function cloneBoard(board)
+		local new = {}
+		for i, v in ipairs(board) do
+			new[i] = v
+		end
+		return new
+	end
+
+	local board = cloneBoard(active.board)
+	local emptyIndex = active.emptyIndex
 
 	-- Compute slide
 	local newBoard, newEmptyIndex, movedCount =
@@ -289,6 +301,7 @@ RequestSlide.OnServerEvent:Connect(function(player, clickedIndex)
 		active.startTime = tick()
 	end
 
+	-- Commit new state
 	active.board = newBoard
 	active.emptyIndex = newEmptyIndex
 	active.moves += movedCount
@@ -306,7 +319,6 @@ RequestSlide.OnServerEvent:Connect(function(player, clickedIndex)
 		end
 
 		active.completed = true
-		active.validated = true
 
 		local solveTime = tick() - active.startTime
 		local moves = active.moves
@@ -325,19 +337,32 @@ RequestSlide.OnServerEvent:Connect(function(player, clickedIndex)
 				autoban(player, "Solved puzzle with zero moves above 16 tiles")
 				return
 			end
-
-			if totalTiles >= 16 and solveTime < 0.3 then
+			-- Slightly safer threshold; you can tune this
+			if totalTiles >= 16 and solveTime < 0.1 then
 				autoban(player, "Solve time impossibly fast")
 				return
 			end
 		end
 
-		-- Report validated run
-		ValidatedRunEvent:Fire(player, rows, cols, solveTime, moves, active.mode, active.blindfold)
+		-- Generate secure run token
+		active.runToken = HttpService:GenerateGUID(false)
+
+		-- Report validated run WITH token
+		ValidatedRunEvent:Fire(
+			player,
+			rows,
+			cols,
+			solveTime,
+			moves,
+			active.mode,
+			active.blindfold,
+			active.runToken
+		)
 
 		-- Clear puzzle state after a short delay to avoid race with client
 		task.delay(0.2, function()
 			activePuzzle[player] = nil
+			lastMove[player] = nil
 		end)
 	end
 
@@ -352,9 +377,9 @@ RequestSlide.OnServerEvent:Connect(function(player, clickedIndex)
 	)
 end)
 
-----------------------------------------------------
+-----
 -- CLEANUP
-----------------------------------------------------
+-----
 Players.PlayerRemoving:Connect(function(player)
 	activePuzzle[player] = nil
 	lastMove[player] = nil
