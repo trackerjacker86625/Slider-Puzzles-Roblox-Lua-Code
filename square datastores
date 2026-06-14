@@ -1,0 +1,373 @@
+local DataStoreService = game:GetService("DataStoreService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local BadgeService = game:GetService("BadgeService")
+
+local BADGE_ID_20x20 = 1006029212851344
+
+----------------------------------------------------
+-- DATASTORES
+----------------------------------------------------
+
+local bestTimeStore           = DataStoreService:GetDataStore("BestTimesV2")
+local bestMovesStore          = DataStoreService:GetDataStore("BestMovesV2")
+local totalTimeStore          = DataStoreService:GetDataStore("TotalTimePlayed")
+local totalMovesStore         = DataStoreService:GetDataStore("TotalMoves")
+local bestTimeImageStore      = DataStoreService:GetDataStore("BestTimes_ImageModeV2")
+local bestTimeBlindfoldStore  = DataStoreService:GetDataStore("BestTimes_BlindfoldedV2")
+
+local orderedCache = {}
+local function getOrdered(name)
+	if not orderedCache[name] then
+		orderedCache[name] = DataStoreService:GetOrderedDataStore(name)
+	end
+	return orderedCache[name]
+end
+
+----------------
+-- REMOTES
+----------------
+
+local ValidatedRunEvent       = ReplicatedStorage:WaitForChild("ValidatedRunEvent") -- bindable not remote
+
+local bestTimeEvent           = ReplicatedStorage:WaitForChild("BestTimeEvent")
+local leastMovesEvent         = ReplicatedStorage:WaitForChild("LeastMovesEvent")
+local statsEvent              = ReplicatedStorage:WaitForChild("StatsEvent")
+local bestTimeImageEvent      = ReplicatedStorage:WaitForChild("BestTimeImageEvent")
+local bestTimeBlindfoldEvent  = ReplicatedStorage:WaitForChild("BestTimeBlindfoldedEvent")
+
+------------------
+-- UTILITIES
+------------------
+
+local function getKey(rows, cols)
+	return rows .. "x" .. cols
+end
+
+local function safeGet(store, key)
+	local ok, result = pcall(function()
+		return store:GetAsync(key)
+	end)
+	if not ok then warn("GetAsync failed:", key, result) end
+	return ok and result or nil
+end
+
+local function safeSet(store, key, value)
+	local ok, err = pcall(function()
+		store:SetAsync(key, value)
+	end)
+	if not ok then warn("SetAsync failed:", key, err) end
+	return ok
+end
+
+-------------------
+-- PLAYER DATA
+-------------------
+
+local playerData = {}
+
+Players.PlayerAdded:Connect(function(player)
+	local userId = player.UserId
+
+	local bestTimes      = safeGet(bestTimeStore, userId) or {}
+	local bestMoves      = safeGet(bestMovesStore, userId) or {}
+	local rawTotalTime   = safeGet(totalTimeStore, userId)
+	local totalTime
+
+	---------------------------------------------------------
+	-- TOTAL TIME LOADING + AUTO‑FIX
+	---------------------------------------------------------
+
+	if type(rawTotalTime) ~= "number" then
+		-- Missing or corrupted → reset
+		totalTime = 0
+
+	elseif rawTotalTime > 165600 then
+		-- Old format (milliseconds)
+		totalTime = rawTotalTime / 1000
+
+		-- Fix main datastore (seconds)
+		safeSet(totalTimeStore, userId, totalTime)
+
+		-- Fix ordered datastore (milliseconds)
+		local ordered = DataStoreService:GetOrderedDataStore("OrderedTotalTime")
+		safeSet(ordered, userId, math.floor(totalTime * 1000))
+
+	else
+		-- Already correct (seconds)
+		totalTime = rawTotalTime
+	end
+
+	---------------------------------------------------------
+	-- LOAD OTHER STATS
+	---------------------------------------------------------
+
+	local totalMoves         = safeGet(totalMovesStore, userId) or 0
+	local bestTimesImage     = safeGet(bestTimeImageStore, userId) or {}
+	local bestTimesBlindfold = safeGet(bestTimeBlindfoldStore, userId) or {}
+
+	---------------------------------------------------------
+	-- STORE IN MEMORY
+	---------------------------------------------------------
+
+	playerData[userId] = {
+		bestTimes = bestTimes,
+		bestMoves = bestMoves,
+		totalTime = totalTime,
+		totalMoves = totalMoves,
+		bestTimesImage = bestTimesImage,
+		bestTimesBlindfold = bestTimesBlindfold,
+
+		pendingTime = 0,
+		pendingMoves = 0,
+
+		bestDirty = false,
+		bestMovesDirty = false,
+		bestImageDirty = false,
+		bestBlindDirty = false,
+
+		totalTimeDirty = false,
+		totalMovesDirty = false,
+
+		orderedPending = {},
+		savePending = false,
+	}
+
+	---------------------------------------------------------
+	-- INITIAL CLIENT SYNC
+	---------------------------------------------------------
+
+	bestTimeEvent:FireClient(player, bestTimes)
+	leastMovesEvent:FireClient(player, bestMoves)
+	statsEvent:FireClient(player, totalTime, totalMoves)
+	bestTimeImageEvent:FireClient(player, bestTimesImage)
+	bestTimeBlindfoldEvent:FireClient(player, bestTimesBlindfold)
+end)
+
+--------------
+-- SAVE LOGIC
+--------------
+
+local function savePlayer(userId)
+	local data = playerData[userId]
+	if not data then return end
+
+	-- Fold pending totals
+	if data.pendingTime > 0 then
+		data.totalTime += data.pendingTime
+		data.pendingTime = 0
+		data.totalTimeDirty = true
+	end
+
+	if data.pendingMoves > 0 then
+		data.totalMoves += data.pendingMoves
+		data.pendingMoves = 0
+		data.totalMovesDirty = true
+	end
+
+	-- Save totals
+	if data.totalTimeDirty then
+		safeSet(totalTimeStore, userId, data.totalTime)
+		data.totalTimeDirty = false
+		data.orderedPending["OrderedTotalTime"] = math.floor(data.totalTime * 1000)
+	end
+
+	if data.totalMovesDirty then
+		safeSet(totalMovesStore, userId, data.totalMoves)
+		data.totalMovesDirty = false
+		data.orderedPending["OrderedTotalMoves"] = data.totalMoves
+	end
+
+	-- Save best times
+	if data.bestDirty then
+		safeSet(bestTimeStore, userId, data.bestTimes)
+		data.bestDirty = false
+	end
+
+	if data.bestMovesDirty then
+		safeSet(bestMovesStore, userId, data.bestMoves)
+		data.bestMovesDirty = false
+	end
+
+	if data.bestImageDirty then
+		safeSet(bestTimeImageStore, userId, data.bestTimesImage)
+		data.bestImageDirty = false
+	end
+
+	if data.bestBlindDirty then
+		safeSet(bestTimeBlindfoldStore, userId, data.bestTimesBlindfold)
+		data.bestBlindDirty = false
+	end
+
+	-- Ordered stores
+	for name, value in pairs(data.orderedPending) do
+		safeSet(getOrdered(name), userId, value)
+		data.orderedPending[name] = nil
+	end
+
+	data.savePending = false
+end
+
+local function scheduleSave(userId)
+	local data = playerData[userId]
+	if not data or data.savePending then return end
+
+	data.savePending = true
+
+	task.delay(15, function()
+		local d = playerData[userId]
+		if not d then return end
+
+		local needsSave =
+			d.bestDirty or d.bestMovesDirty or d.bestImageDirty or d.bestBlindDirty or
+			d.totalTimeDirty or d.totalMovesDirty or
+			d.pendingTime > 0 or d.pendingMoves > 0 or
+			next(d.orderedPending) ~= nil
+
+		if needsSave then
+			savePlayer(userId)
+		else
+			d.savePending = false
+		end
+
+		local plr = Players:GetPlayerByUserId(userId)
+		if plr then
+			statsEvent:FireClient(plr, d.totalTime + d.pendingTime, d.totalMoves + d.pendingMoves)
+		end
+	end)
+end
+
+--------------------
+-- VALIDATED RUN HANDLER (SAFE)
+--------------------
+local ActivePuzzle = require(game.ServerScriptService.ActivePuzzleModule)
+local activeCircle = ActivePuzzle
+
+ValidatedRunEvent.Event:Connect(function(
+	player,
+	rows,
+	cols,
+	solveTime,
+	moves,
+	puzzleMode,
+	blindfoldUsed,
+	token -- NEW: secure run token
+)
+
+	local userId = player.UserId
+	local data = playerData[userId]
+	if not data then return end
+
+	-----------------------------
+	-- SECURITY CHECK: Token-based validation
+	-----------------------------
+	local active = activeCircle[player]
+
+	-- Must have active puzzle AND matching token
+	if not active or token ~= active.runToken then
+		player:Kick("Cheating detected: Invalid or missing run token.")
+		return
+	end
+
+	----------------------------
+	-- PROCESS VALIDATED RUN
+	----------------------------
+
+	local key = getKey(rows, cols)
+	local timeMs = math.floor(solveTime * 1000)
+
+	----------------------
+	-- BEST TIME (NORMAL)
+	----------------------
+	local bestTimes = data.bestTimes
+	local currentBest = bestTimes[key]
+
+	if not currentBest or solveTime < currentBest then
+		bestTimes[key] = solveTime
+		data.bestDirty = true
+		data.orderedPending["OrderedBestTimesV2_" .. key] = timeMs
+	end
+
+	bestTimeEvent:FireClient(player, bestTimes)
+
+	-----------------------
+	-- IMAGE MODE
+	-----------------------
+	if puzzleMode == "Images" then
+		local imgTimes = data.bestTimesImage
+		local bestImg = imgTimes[key]
+
+		if not bestImg or solveTime < bestImg then
+			imgTimes[key] = solveTime
+			data.bestImageDirty = true
+			data.orderedPending["OrderedBestTimeImageV2_" .. key] = timeMs
+		end
+
+		bestTimeImageEvent:FireClient(player, imgTimes)
+	end
+
+	--------------------
+	-- BLINDFOLDED MODE
+	--------------------
+	if blindfoldUsed then
+		local blindTimes = data.bestTimesBlindfold
+		local bestBlind = blindTimes[key]
+
+		if not bestBlind or solveTime < bestBlind then
+			blindTimes[key] = solveTime
+			data.bestBlindDirty = true
+			data.orderedPending["OrderedBestTimeBlindfoldedV2_" .. key] = timeMs
+		end
+
+		bestTimeBlindfoldEvent:FireClient(player, blindTimes)
+	end
+
+	----------------------
+	-- LEAST MOVES
+	----------------------
+	local bestMoves = data.bestMoves
+	local currentBestMoves = bestMoves[key]
+
+	if not currentBestMoves or moves < currentBestMoves then
+		bestMoves[key] = moves
+		data.bestMovesDirty = true
+		data.orderedPending["OrderedLeastMovesV2_" .. key] = moves
+	end
+
+	leastMovesEvent:FireClient(player, bestMoves)
+
+	----------------------------------------------------
+	-- TOTALS
+	----------------------------------------------------
+	data.pendingTime += solveTime
+	data.pendingMoves += moves
+
+	statsEvent:FireClient(
+		player,
+		data.totalTime + data.pendingTime,
+		data.totalMoves + data.pendingMoves
+	)
+
+	scheduleSave(userId)
+	activeCircle[player] = nil
+	active.runToken = nil
+end)
+
+
+-----------------
+-- PLAYER REMOVAL + SHUTDOWN
+-----------------
+
+Players.PlayerRemoving:Connect(function(player)
+	local userId = player.UserId
+	if playerData[userId] then
+		savePlayer(userId)
+		playerData[userId] = nil
+	end
+end)
+
+game:BindToClose(function()
+	for userId in pairs(playerData) do
+		savePlayer(userId)
+	end
+end)
