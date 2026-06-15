@@ -1,6 +1,3 @@
------------------------
--- REFERENCES
------------------------
 local board = script.Parent
 local gui = board.Parent
 
@@ -34,7 +31,7 @@ local leaderboardSize = leaderboard:WaitForChild("LeaderboardSizeLabel")
 local savedBestTimes = {}
 local savedBestMoves = {}
 local blindfoldActive = false
-
+local circleActive = false
 ------------------------
 -- VARIABLES
 ------------------------
@@ -45,6 +42,7 @@ local tileGrid = {}         -- tileGrid[row][col] = tile or nil
 local tileRC = {}           -- tileRC[tile] = {row, col}
 local maskGrid = {}         -- maskGrid[row][col] = true/false
 local emptyIndex = 0        -- index in tileOrder of blank tile
+local tileConnections = {}
 
 local timerRunning = false
 local elapsedTime = 0
@@ -52,23 +50,25 @@ local moves = 0
 local inputLocked = true
 local TILE_WIDTH = 0
 local TILE_HEIGHT = 0
+local timerId = 0
 
 ---------------------------------------------------------------------
 -- TIMER
 ---------------------------------------------------------------------
 local function stopTimer()
 	timerRunning = false
+	timerId += 1 -- invalidate any running loops
 end
 
 local function startTimer()
 	if timerRunning then return end
 	timerRunning = true
 
-	local startTime = tick() - elapsedTime  -- preserves paused time
+	elapsedTime = 0
+	local startTime = tick()
 
 	task.spawn(function()
 		while timerRunning do
-			-- compute total elapsed time based on real clock
 			elapsedTime = tick() - startTime
 
 			local totalSeconds = math.floor(elapsedTime)
@@ -107,10 +107,78 @@ local function getRowColor(row, totalRows)
 	local hue = (row - 1) / totalRows
 	return Color3.fromHSV(hue, 0.6, 1)
 end
-
 local function getColumnColor(col, totalCols)
 	local hue = (col - 1) / totalCols
 	return Color3.fromHSV(hue, 0.6, 1)
+end
+
+local function circleTopBottom(mask, v, h)
+	local colors = {}
+	local mid = math.floor(v / 2)
+	local index = 0
+
+	for r = 1, v do
+		for c = 1, h do
+			if mask[r][c] then
+				index += 1
+
+				colors[index] =
+					(r <= mid)
+					and getRowColor(1, 2)
+					or  getRowColor(2, 2)
+			end
+		end
+	end
+
+	return colors
+end
+
+local function circleLeftRight(mask, v, h)
+	local colors = {}
+	local mid = math.floor(h / 2)
+	local index = 0
+
+	for r = 1, v do
+		for c = 1, h do
+			if mask[r][c] then
+				index += 1
+
+				colors[index] =
+					(c <= mid)
+					and getColumnColor(1, 2)
+					or  getColumnColor(2, 2)
+			end
+		end
+	end
+
+	return colors
+end
+
+local function circleFourCorners(mask, v, h)
+	local colors = {}
+	local midR = math.floor(v / 2)
+	local midC = math.floor(h / 2)
+	local index = 0
+
+	for r = 1, v do
+		for c = 1, h do
+			if mask[r][c] then
+				index += 1
+
+				if r <= midR then
+					colors[index] = (c <= midC)
+						and getRowColor(1, 4)
+						or  getRowColor(2, 4)
+				else
+					colors[index] = (c <= midC)
+						and getRowColor(3, 4)
+						or  getRowColor(4, 4)
+				end
+			end
+		end
+	end
+
+	return colors
 end
 
 ---------------------------------------------------------------------
@@ -528,7 +596,13 @@ end
 ---------------------------------------------------------------------
 -- BUILD CIRCLE PUZZLE
 ---------------------------------------------------------------------
+local pressedTile = nil
+local isTouchDevice = game:GetService("UserInputService").TouchEnabled
+
 local function buildCirclePuzzle(vDiam, hDiam)
+	if not circleActive then
+		return
+	end
 	-- Clear old tiles
 	for _, child in ipairs(board:GetChildren()) do
 		if child:IsA("TextButton") then
@@ -593,6 +667,16 @@ local function buildCirclePuzzle(vDiam, hDiam)
 	end
 
 	local textPaddingScale = getTextPaddingScale(settingsFrame.TextSize.Value)
+	local patternColors = nil
+	local mode = colorpatternMode.Value
+
+	if mode == "Top/Bottom" then
+		patternColors = circleTopBottom(maskGrid, vDiam, hDiam)
+	elseif mode == "Left/Right" then
+		patternColors = circleLeftRight(maskGrid, vDiam, hDiam)
+	elseif mode == "4 Corners" then
+		patternColors = circleFourCorners(maskGrid, vDiam, hDiam)
+	end
 
 	-- Create tiles
 	local currentIndex = 0
@@ -636,10 +720,16 @@ local function buildCirclePuzzle(vDiam, hDiam)
 						padding.PaddingRight = UDim.new(textPaddingScale, 0)
 
 						local mode = colorpatternMode.Value
+
 						if mode == "Rows" then
 							tile.BackgroundColor3 = getRowColor(r, vDiam)
+
 						elseif mode == "Columns" then
 							tile.BackgroundColor3 = getColumnColor(c, hDiam)
+
+						elseif patternColors then
+							tile.BackgroundColor3 = patternColors[currentIndex]
+
 						else
 							tile.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
 						end
@@ -676,50 +766,97 @@ local function buildCirclePuzzle(vDiam, hDiam)
 
 	-- INPUT EVENTS
 	for _, tile in ipairs(tileOrder) do
-		tile.InputBegan:Connect(function(input)
-			if input.UserInputType == Enum.UserInputType.MouseButton1
-				or input.UserInputType == Enum.UserInputType.Touch then
+		tileConnections[tile] = {}
 
-				if slidingModeValue.Value then return end
+		local con1 = tile.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 then
+				pressedTile = tile
+			end
+		end)
+
+		local con2 = tile.MouseEnter:Connect(function()
+			if slidingModeValue.Value then
 				processTile(tile)
 			end
 		end)
 
-		tile.MouseEnter:Connect(function()
-			if not slidingModeValue.Value then return end
-			processTile(tile)
-		end)
+		table.insert(tileConnections[tile], con1)
+		table.insert(tileConnections[tile], con2)
 	end
-
 	lockTiles()
 end
+---------------- build puzzle end
+
+local UIS = game:GetService("UserInputService")
+
+UIS.InputEnded:Connect(function(input)
+	-- Mouse release
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		if pressedTile and not slidingModeValue.Value then
+			processTile(pressedTile)
+		end
+		pressedTile = nil
+		return
+	end
+
+	-- Touch release
+	if input.UserInputType == Enum.UserInputType.Touch then
+		if pressedTile and not slidingModeValue.Value then
+			processTile(pressedTile)
+		end
+		pressedTile = nil
+	end
+end)
+if isTouchDevice then
+	UIS.TouchStarted:Connect(function(touch)
+		local pos = touch.Position
+		local gui = game:GetService("Players").LocalPlayer.PlayerGui
+		local objs = gui:GetGuiObjectsAtPosition(pos.X, pos.Y)
+
+		for _, obj in ipairs(objs) do
+			if tileIndex[obj] then
+				pressedTile = obj
+				break
+			end
+		end
+	end)
+end
+
 
 local function restoreBlindfold()
 	if not blindfoldActive then
-		return -- nothing to restore
+		return
 	end
+
 	local rows = vDiamValue.Value
 	local cols = hDiamValue.Value
+	local mode = colorpatternMode.Value
 
+	-- Generate mask once
+	local mask = generateCircleMask(rows, cols)
+
+	-- Precompute circle pattern colors
+	local patternColors = nil
+
+	if mode == "Top/Bottom" then
+		patternColors = circleTopBottom(mask, rows, cols)
+
+	elseif mode == "Left/Right" then
+		patternColors = circleLeftRight(mask, rows, cols)
+
+	elseif mode == "4 Corners" then
+		patternColors = circleFourCorners(mask, rows, cols)
+	end
 	for _, tile in ipairs(tileOrder) do
-
-		-- REAL BLANK TILE (logic-based, not visual)
+		-- REAL BLANK TILE
 		if isRealBlank(tile) then
-			-- ensure it looks blank
 			tile.Text = ""
 			tile.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
 			tile.BorderSizePixel = 0
-
 			continue
 		end
-
-		-- Get row/col for this tile
-		local correct = correctIndexMap[tile]
-		local row = math.ceil(correct / cols)
-		local col = ((correct - 1) % cols) + 1
-
 		------------------------------------------------------------------
-		-- RESTORE TEXT (NUMBER MODE)
+		-- RESTORE TEXT
 		------------------------------------------------------------------
 		if puzzleModeValue.Value == "Numbers" then
 			local num = tonumber(tile.Name:match("%d+"))
@@ -727,9 +864,8 @@ local function restoreBlindfold()
 		else
 			tile.Text = ""
 		end
-
 		------------------------------------------------------------------
-		-- RESTORE IMAGE (IMAGE MODE)
+		-- RESTORE IMAGE
 		------------------------------------------------------------------
 		if puzzleModeValue.Value == "Images" and selectedImageIdValue.Value ~= "" then
 			local img = tile:FindFirstChildOfClass("ImageLabel")
@@ -742,32 +878,38 @@ local function restoreBlindfold()
 				img.Active = false
 			end
 
-			img.Image = "rbxassetid://" .. selectedImageIdValue.Value
-			img.ScaleType = Enum.ScaleType.Crop
+			local solvedIndex = correctIndexMap[tile]
+			local sr, sc = solvedRCFromIndex(solvedIndex, rows, cols)
 
 			local sliceW = 1024 / cols
 			local sliceH = 1024 / rows
 
+			img.Image = "rbxassetid://" .. selectedImageIdValue.Value
+			img.ScaleType = Enum.ScaleType.Crop
 			img.ImageRectSize = Vector2.new(sliceW, sliceH)
-			img.ImageRectOffset = Vector2.new(
-				(col - 1) * sliceW,
-				(row - 1) * sliceH
-			)
+			img.ImageRectOffset = Vector2.new((sc - 1) * sliceW, (sr - 1) * sliceH)
+
 		else
 			local img = tile:FindFirstChildOfClass("ImageLabel")
 			if img then img:Destroy() end
 		end
+
 		------------------------------------------------------------------
-		-- RESTORE BACKGROUND COLOR
+		-- RESTORE BACKGROUND COLOR (Circle Version)
 		------------------------------------------------------------------
-		local mode = colorpatternMode.Value
 		local solvedIndex = correctIndexMap[tile]
 		local sr, sc = solvedRCFromIndex(solvedIndex, rows, cols)
 
 		if mode == "Rows" then
 			tile.BackgroundColor3 = getRowColor(sr, rows)
+
 		elseif mode == "Columns" then
 			tile.BackgroundColor3 = getColumnColor(sc, cols)
+
+		elseif patternColors then
+			-- EXACT SAME BEHAVIOR AS SQUARE PUZZLES
+			tile.BackgroundColor3 = patternColors[solvedIndex]
+
 		else
 			tile.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
 		end
@@ -775,9 +917,9 @@ local function restoreBlindfold()
 		tile.BackgroundTransparency = 0
 		tile.BorderSizePixel = 0
 	end
+
 	blindfoldActive = false
 end
-
 ---------------------------------------------------------------------
 -- PERMUTATION PARITY
 ---------------------------------------------------------------------
@@ -799,7 +941,6 @@ local function permutationParity(tileOrder, correctIndexMap)
 
 	return (N - cycles) % 2
 end
-
 
 ---------------------------------------------------------------------
 -- BLANK DISTANCE PARITY (BFS on maskGrid)
@@ -834,7 +975,6 @@ local function blankDistanceParity(vDiam, hDiam, blankR, blankC, goalR, goalC)
 
 	return nil  -- should never happen on a connected board
 end
-
 
 ---------------------------------------------------------------------
 -- FINAL SOLVABILITY TEST (Fix 2)
@@ -882,7 +1022,6 @@ local function resetTileOrderToSolved()
 	tileOrder = solved
 end
 
-
 ---------------------------------------------------------------------
 -- SHUFFLE (random permutation + solvability check)
 ---------------------------------------------------------------------
@@ -928,6 +1067,9 @@ local function shuffleCirclePuzzle(vDiam, hDiam)
 	end
 
 	emptyIndex = findEmptyIndex()
+	if blindfoldedModeValue.Value then
+		startTimer()
+	end
 	inputLocked = false
 	updateTilePositions(TILE_WIDTH, TILE_HEIGHT)
 end
@@ -939,6 +1081,21 @@ colorpatternMode.Changed:Connect(function()
 	local h = hDiamValue.Value
 	local mode = colorpatternMode.Value
 
+	local mask = generateCircleMask(v, h)
+
+	-- Precompute pattern colors
+	local patternColors = nil
+
+	if mode == "Top/Bottom" then
+		patternColors = circleTopBottom(mask, v, h)
+
+	elseif mode == "Left/Right" then
+		patternColors = circleLeftRight(mask, v, h)
+
+	elseif mode == "4 Corners" then
+		patternColors = circleFourCorners(mask, v, h)
+	end
+
 	for _, tile in ipairs(tileOrder) do
 		if tile.Text ~= "" then
 			local solvedIndex = correctIndexMap[tile]
@@ -946,8 +1103,14 @@ colorpatternMode.Changed:Connect(function()
 
 			if mode == "Rows" then
 				tile.BackgroundColor3 = getRowColor(sr, v)
+
 			elseif mode == "Columns" then
 				tile.BackgroundColor3 = getColumnColor(sc, h)
+
+			elseif patternColors then
+				-- EXACTLY like square puzzles
+				tile.BackgroundColor3 = patternColors[solvedIndex] --1104
+
 			else
 				tile.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
 			end
@@ -959,7 +1122,7 @@ end)
 -- REBUILD WHEN SETTINGS CHANGE
 ---------------------------------------------------------------------
 local function rebuild()
-
+	task.wait(0.1)
 	local v = vDiamValue.Value
 	local h = hDiamValue.Value
 
@@ -970,9 +1133,6 @@ local function rebuild()
 	timerRunning = false
 	elapsedTime = 0
 	moves = 0
-
-	timerLabel.Text = "Time: 0:00.00"
-	movesLabel.Text = "Moves: 0"
 
 	sizeLabel.Text = "Circle: " .. v .. "x" .. h
 	statisticsSize.Text = "Circle " .. v .. "x" .. h
@@ -989,11 +1149,6 @@ hDiamValue.Changed:Connect(rebuild)
 puzzleModeValue.Changed:Connect(rebuild)
 selectedImageIdValue.Changed:Connect(rebuild)
 blindfoldedModeValue.Changed:Connect(rebuild)
-gui:GetPropertyChangedSignal("Enabled"):Connect(function()
-	if gui.Enabled == false then
-		rebuild()
-	end
-end)
 
 ---------------------------------------------------------------------
 -- RELAYOUT ON SCREEN / SIZE CHANGES
@@ -1071,36 +1226,48 @@ gui:GetPropertyChangedSignal("AbsoluteSize"):Connect(relayoutPuzzle)
 settingsFrame.PuzzleSize.Changed:Connect(relayoutPuzzle)
 settingsFrame.TextSize.Changed:Connect(relayoutPuzzle)
 
+local function destroyCirclePuzzle()
+	if timerRunning then
+		stopTimer()
+	end
+	-- disconnect listeners
+	for tile, conns in pairs(tileConnections) do
+		for _, conn in ipairs(conns) do
+			conn:Disconnect()
+		end
+	end
+	tileConnections = {}
+
+	-- destroy tiles
+	for _, child in ipairs(board:GetChildren()) do
+		if child:IsA("TextButton") then
+			child:Destroy()
+		end
+	end
+
+	-- clear tables
+	tileOrder = {}
+	tileIndex = {}
+	correctIndexMap = {}
+	tileGrid = {}
+	tileRC = {}
+	maskGrid = {}
+	emptyIndex = nil
+end
+gui:GetPropertyChangedSignal("Enabled"):Connect(function()
+	if gui.Enabled then
+		circleActive = true
+		rebuild()
+	else
+		circleActive = false
+		destroyCirclePuzzle()
+	end
+end)
+
 ---------------------------------------------------------------------
 -- INITIALIZE
 ---------------------------------------------------------------------
-rebuild()
-
 local shuffleEvent = gui:WaitForChild("CircleShuffleEvent")
 shuffleEvent.Event:Connect(function()
 	shuffleCirclePuzzle(vDiamValue.Value, hDiamValue.Value)
 end)
-
-
-scrapped circle generator. produces a more accurate circle on larger puzzles rather than a diamond. I do not like the generation for smaller puzzles.
-local function generateCircleMask(rows, cols)
-    local mask = {}
-
-    local cx = (cols + 1) / 2
-    local cy = (rows + 1) / 2
-    local rx = cols / 2
-    local ry = rows / 2
-
-    for r = 1, rows do
-        mask[r] = {}
-        for c = 1, cols do
-            local dx = (c - cx) / rx
-            local dy = (r - cy) / ry
-            local dist = dx*dx + dy*dy
-
-            mask[r][c] = (dist <= 1)
-        end
-    end
-
-    return mask
-end
