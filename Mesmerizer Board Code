@@ -1,0 +1,483 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+
+local player = Players.LocalPlayer
+local board = script.Parent
+local gui = board.Parent
+
+-- Top bar UI
+local topBar = gui:WaitForChild("TopBar")
+local timerLabel = topBar:WaitForChild("TimerLabel")
+local movesLabel = topBar:WaitForChild("MovesLabel")
+local sizeLabel = topBar:WaitForChild("SizeLabel")
+local BestTimeLabel = topBar:WaitForChild("BestTimeLabel")
+local LeastAmountofMovesLabel = topBar:WaitForChild("LeastAmountofMovesLabel")
+local leaderboard = gui:WaitForChild("LeaderboardFrame")
+local leaderboardSize = leaderboard:WaitForChild("LeaderboardSizeLabel")
+
+-- Settings
+local settingsFrame = gui:WaitForChild("SettingsFrame")
+local rowsValue = settingsFrame:WaitForChild("PuzzleRows")
+local colsValue = settingsFrame:WaitForChild("PuzzleColumns")
+local puzzleSizeValue = settingsFrame:WaitForChild("PuzzleSize")
+local slidingModeValue = settingsFrame:WaitForChild("SlidingModeEnabled")
+
+-- Remotes
+local VideoPuzzleStart   = ReplicatedStorage:WaitForChild("VideoPuzzleStart")
+local VideoPuzzleInit    = ReplicatedStorage:WaitForChild("VideoPuzzleInit")
+local VideoRequestSlide  = ReplicatedStorage:WaitForChild("VideoRequestSlide")
+local VideoSlideResult   = ReplicatedStorage:WaitForChild("VideoSlideResult")
+
+local VideoBestTimeEvent = ReplicatedStorage:WaitForChild("VideoBestTimeEvent")
+local LeastMovesEvent    = ReplicatedStorage:WaitForChild("LeastMovesEvent")
+
+local shuffleEvent = gui:WaitForChild("VideoShuffleEvent")
+
+-- Animation frames
+local FRAME_IMAGES = {
+	"rbxassetid://86296497511703",
+	"rbxassetid://126630019361141",
+	"rbxassetid://108918892244915",
+	"rbxassetid://124647358031587",
+	"rbxassetid://106690107496340",
+	"rbxassetid://93927685951515",
+	"rbxassetid://100893404635208",
+	"rbxassetid://128841652108935",
+	"rbxassetid://132272107531733",
+	"rbxassetid://130165145119976"
+}
+local TOTAL_FRAMES = #FRAME_IMAGES
+
+-- State
+local tileOrder = {}
+local tileIndex = {}
+local pressedTile = nil
+local inputLocked = true
+local timerRunning = false
+local elapsedTime = 0
+local moves = 0
+local savedBestTimes = {}
+local savedBestMoves = {}
+local lastSlideIndex = nil
+
+---------------------------------------------------------
+-- COSMETIC TIMER
+---------------------------------------------------------
+local function stopTimer()
+	timerRunning = false
+end
+
+local function startTimer()
+	if timerRunning then return end
+	timerRunning = true
+
+	local startTime = tick() - elapsedTime
+
+	task.spawn(function()
+		while timerRunning do
+			elapsedTime = tick() - startTime
+
+			local totalSeconds = math.floor(elapsedTime)
+			local minutes = math.floor(totalSeconds / 60)
+			local seconds = totalSeconds % 60
+			local milliseconds = math.floor((elapsedTime - totalSeconds) * 1000)
+
+			timerLabel.Text = string.format("Time: %d:%02d.%03d", minutes, seconds, milliseconds)
+			task.wait(0.01)
+		end
+	end)
+end
+
+---------------------------------------------------------
+-- TILE LOCKING
+---------------------------------------------------------
+local function lockTiles()
+	inputLocked = true
+	for _, tile in ipairs(tileOrder) do
+		tile.Active = false
+	end
+end
+
+local function unlockTiles()
+	inputLocked = false
+	for _, tile in ipairs(tileOrder) do
+		tile.Active = true
+	end
+end
+
+---------------------------------------------------------
+-- PUZZLE BUILDING
+---------------------------------------------------------
+local function getPuzzleScale(sizeName)
+	local map = {
+		["100%"] = 0.97,
+		["90%"] = 0.90,
+		["80%"] = 0.80,
+		["70%"] = 0.70,
+		["60%"] = 0.60,
+		["50%"] = 0.50,
+		["40%"] = 0.40
+	}
+	return map[sizeName] or 0.90
+end
+
+local function buildPuzzle(rows, cols, layout)
+	-- Clear old tiles
+	for _, child in ipairs(board:GetChildren()) do
+		if child:IsA("TextButton") then
+			child:Destroy()
+		end
+	end
+
+	tileOrder = {}
+	tileIndex = {}
+	lastSlideIndex = nil
+
+	-- Size calculation
+	local camera = workspace.CurrentCamera
+	local screenH = camera.ViewportSize.Y
+
+	local scale = getPuzzleScale(puzzleSizeValue.Value)
+	local baseSize = screenH * scale
+
+	local puzzleW, puzzleH
+	if rows == cols then
+		puzzleW, puzzleH = baseSize, baseSize
+	elseif cols > rows then
+		puzzleW = baseSize
+		puzzleH = baseSize * (rows / cols)
+	else
+		puzzleH = baseSize
+		puzzleW = baseSize * (cols / rows)
+	end
+
+	puzzleW = math.floor(puzzleW / cols) * cols
+	puzzleH = math.floor(puzzleH / rows) * rows
+
+	board.Size = UDim2.fromOffset(puzzleW, puzzleH)
+
+	local totalTiles = rows * cols
+
+	for i = 1, totalTiles do
+		local tile = Instance.new("TextButton")
+		tile.Name = "Tile" .. i
+		tile.Parent = board
+		tile.LayoutOrder = i
+		tile.Text = ""
+		tile.BackgroundTransparency = 1
+		tile.BorderSizePixel = 0
+		tile.AutoButtonColor = false
+		tile.ZIndex = 2
+
+		tileOrder[i] = tile
+		tileIndex[tile] = i
+
+		-- Image tile
+		if i ~= totalTiles then
+			local img = Instance.new("ImageLabel")
+			img.Parent = tile
+			img.Size = UDim2.fromScale(1, 1)
+			img.BackgroundTransparency = 1
+			img.BorderSizePixel = 0
+			img.ZIndex = 2
+
+			local row = math.ceil(i / cols)
+			local col = ((i - 1) % cols) + 1
+
+			local sliceW = 1024 / cols
+			local sliceH = 1024 / rows
+
+			img.ImageRectSize = Vector2.new(sliceW, sliceH)
+			img.ImageRectOffset = Vector2.new(
+				(col - 1) * sliceW,
+				(row - 1) * sliceH
+			)
+		else
+			tile.Active = false
+		end
+
+		local aspect = Instance.new("UIAspectRatioConstraint")
+		aspect.AspectRatio = 1
+		aspect.Parent = tile
+
+		-- CLICK INPUT
+		tile.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 then
+				pressedTile = tile
+			end
+		end)
+
+		-- SLIDING MODE INPUT
+		tile.MouseEnter:Connect(function()
+			if slidingModeValue.Value and not inputLocked then
+				local idx = tile.LayoutOrder  -- POSITION, not tileIndex
+				if idx and idx ~= lastSlideIndex then
+					lastSlideIndex = idx
+					VideoRequestSlide:FireServer(idx)
+				end
+			end
+		end)
+	end
+
+	-- Grid layout
+	local grid = board:FindFirstChildOfClass("UIGridLayout")
+	if not grid then
+		grid = Instance.new("UIGridLayout")
+		grid.Parent = board
+	end
+
+	grid.FillDirection = Enum.FillDirection.Horizontal
+	grid.HorizontalAlignment = Enum.HorizontalAlignment.Center
+	grid.VerticalAlignment = Enum.VerticalAlignment.Center
+	grid.SortOrder = Enum.SortOrder.LayoutOrder
+	grid.CellPadding = UDim2.new(0, 0, 0, 0)
+	grid.CellSize = UDim2.new(1 / cols, 0, 1 / rows, 0)
+
+	-- Apply server layout
+	for pos, tileValue in ipairs(layout) do
+		local tile = board:FindFirstChild("Tile" .. tileValue)
+		if tile then
+			tile.LayoutOrder = pos
+		end
+	end
+	lockTiles()
+end
+
+---------------------------------------------------------
+-- RELAYOUT ON RESIZE
+---------------------------------------------------------
+local function relayoutPuzzle()
+	task.wait(0.05)
+
+	local rows = rowsValue.Value
+	local cols = colsValue.Value
+
+	local camera = workspace.CurrentCamera
+	local screenH = camera.ViewportSize.Y
+
+	local scale = getPuzzleScale(puzzleSizeValue.Value)
+	local baseSize = screenH * scale
+
+	local puzzleW, puzzleH
+	if rows == cols then
+		puzzleW, puzzleH = baseSize, baseSize
+	elseif cols > rows then
+		puzzleW = baseSize
+		puzzleH = baseSize * (rows / cols)
+	else
+		puzzleH = baseSize
+		puzzleW = baseSize * (cols / rows)
+	end
+
+	puzzleW = math.floor(puzzleW / cols) * cols
+	puzzleH = math.floor(puzzleH / rows) * rows
+
+	board.Size = UDim2.fromOffset(puzzleW, puzzleH)
+end
+
+gui:GetPropertyChangedSignal("AbsoluteSize"):Connect(relayoutPuzzle)
+puzzleSizeValue.Changed:Connect(relayoutPuzzle)
+
+---------------------------------------------------------
+-- DESTROY PUZZLE
+---------------------------------------------------------
+local function destroyPuzzle()
+	stopTimer()
+
+	for _, child in ipairs(board:GetChildren()) do
+		if child:IsA("TextButton") then
+			child:Destroy()
+		end
+	end
+
+	tileOrder = {}
+	tileIndex = {}
+	pressedTile = nil
+	inputLocked = true
+end
+
+---------------------------------------------------------
+-- REBUILD PUZZLE IN SOLVED STATE
+---------------------------------------------------------
+local function formatTime(t)
+	if not t then
+		return "Best Time: --:--.--"
+	end
+
+	local totalSeconds = math.floor(t)
+	local minutes = math.floor(totalSeconds / 60)
+	local seconds = totalSeconds % 60
+	local centi = math.floor((t - totalSeconds) * 100)
+
+	return string.format("Best Time: %d:%02d.%02d", minutes, seconds, centi)
+end
+
+local function formatMoves(m)
+	if not m then
+		return "Least Moves: --"
+	end
+	return "Least Moves: " .. m
+end
+local function rebuild()
+	task.wait(0.05)
+
+	local rows = rowsValue.Value
+	local cols = colsValue.Value
+
+	stopTimer()
+	elapsedTime = 0
+	timerLabel.Text = "Time: 0:00.00"
+	moves = 0
+	movesLabel.Text = "Moves: 0"
+	sizeLabel.Text = "Size: " .. rows .. "x" .. cols
+	leaderboardSize.Text = "Mesmerizer Mode " .. rows .. "x" .. cols
+
+	local key = tostring(rows) .. "x" .. tostring(cols)
+	BestTimeLabel.Text = formatTime(savedBestTimes[key])
+	LeastAmountofMovesLabel.Text = formatMoves(savedBestMoves[key])
+
+	-- Build solved puzzle visually
+	local solvedLayout = {}
+	for i = 1, rows * cols do
+		solvedLayout[i] = i
+	end
+
+	buildPuzzle(rows, cols, solvedLayout)
+
+	lockTiles()
+end
+rowsValue.Changed:Connect(rebuild)
+colsValue.Changed:Connect(rebuild)
+gui:GetPropertyChangedSignal("Enabled"):Connect(function()
+	if gui.Enabled then
+		rebuild()
+	else
+		destroyPuzzle()
+	end
+end)
+
+---------------------------------------------------------
+-- CLICK RELEASE → SEND SLIDE REQUEST
+---------------------------------------------------------
+UIS.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+
+		if inputLocked then
+			pressedTile = nil
+			return
+		end
+
+		if pressedTile then
+			local index = pressedTile.LayoutOrder  -- POSITION, not tileIndex
+			VideoRequestSlide:FireServer(index)
+		end
+
+		pressedTile = nil
+	end
+end)
+
+---------------------------------------------------------
+-- SERVER → CLIENT: INITIAL PUZZLE
+---------------------------------------------------------
+VideoPuzzleInit.OnClientEvent:Connect(function(r, c, layout)
+	buildPuzzle(r, c, layout)
+	unlockTiles()
+end)
+
+---------------------------------------------------------
+-- SERVER → CLIENT: SLIDE RESULT
+---------------------------------------------------------
+VideoSlideResult.OnClientEvent:Connect(function(newBoard, movedCount, newEmptyIndex, newMoves, solved)
+	for pos, tileValue in ipairs(newBoard) do
+		local tile = board:FindFirstChild("Tile" .. tileValue)
+		if tile then
+			tile.LayoutOrder = pos
+		end
+	end
+
+	-- UPDATE moves FIRST
+	moves = newMoves
+	movesLabel.Text = "Moves: " .. moves
+
+	-- THEN check if timer should start
+	if moves > 0 and not timerRunning then
+		startTimer()
+	end
+
+	if solved then
+		stopTimer()
+		lockTiles()
+	end
+end)
+
+---------------------------------------------------------
+-- BEST TIME / MOVES UI
+---------------------------------------------------------
+VideoBestTimeEvent.OnClientEvent:Connect(function(allTimes)
+	savedBestTimes = allTimes or {}
+	local rows = rowsValue.Value
+	local cols = colsValue.Value
+	local key = tostring(rows) .. "x" .. tostring(cols)
+	BestTimeLabel.Text = formatTime(savedBestTimes[key])
+end)
+
+LeastMovesEvent.OnClientEvent:Connect(function(allMoves)
+	savedBestMoves = allMoves or {}
+	local rows = rowsValue.Value
+	local cols = colsValue.Value
+	local key = tostring(rows) .. "x" .. tostring(cols)
+	LeastAmountofMovesLabel.Text = formatMoves(savedBestMoves[key])
+end)
+
+---------------------------------------------------------
+-- FRAME ANIMATION LOOP
+---------------------------------------------------------
+local function runAnimation()
+	local frame = 1
+
+	while gui.Enabled do
+		local currentImage = FRAME_IMAGES[frame]
+
+		for _, tile in ipairs(tileOrder) do
+			local img = tile:FindFirstChildOfClass("ImageLabel")
+			if img then
+				img.Image = currentImage
+			end
+		end
+
+		frame += 1
+		if frame > TOTAL_FRAMES then
+			frame = 1
+		end
+
+		task.wait(0.1)
+	end
+end
+
+task.spawn(function()
+	while true do
+		if gui.Enabled then
+			runAnimation()
+		end
+		gui:GetPropertyChangedSignal("Enabled"):Wait()
+	end
+end)
+
+---------------------------------------------------------
+-- SHUFFLE BUTTON → REQUEST SERVER PUZZLE
+---------------------------------------------------------
+local function startPuzzle()
+	local r = rowsValue.Value
+	local c = colsValue.Value
+
+	stopTimer()
+	elapsedTime = 0
+	timerLabel.Text = "Time: 0:00.00"
+	moves = 0
+	movesLabel.Text = "Moves: 0"
+
+	VideoPuzzleStart:FireServer(r, c)
+end
+
+shuffleEvent.Event:Connect(startPuzzle)
