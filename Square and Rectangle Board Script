@@ -1,984 +1,374 @@
------------------
--- REFERENCES
------------------
-local board = script.Parent
-local gui = board.Parent
-
-local topBar = gui:WaitForChild("TopBar")
-local timerLabel = topBar:WaitForChild("TimerLabel")
-local movesLabel = topBar:WaitForChild("MovesLabel")
-local sizeLabel = topBar:WaitForChild("SizeLabel")
-local BestTimeLabel = topBar:WaitForChild("BestTimeLabel")
-local LeastAmountofMovesLabel = topBar:WaitForChild("LeastAmountofMovesLabel")
-
-local settingsFrame = gui:WaitForChild("SettingsFrame")
-local rowsValue = settingsFrame:WaitForChild("PuzzleRows")
-local colsValue = settingsFrame:WaitForChild("PuzzleColumns")
-local slidingModeValue = settingsFrame:WaitForChild("SlidingModeEnabled")
-local colorpatternMode = settingsFrame:WaitForChild("ColorPatternMode")
-local blindfoldedModeValue = settingsFrame:WaitForChild("BlindfoldedModeEnabled")
-local puzzleModeValue = settingsFrame:WaitForChild("PuzzleMode")
-local selectedImageIdValue = settingsFrame:WaitForChild("SelectedImageID")
-
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local bestTimeEvent = ReplicatedStorage:WaitForChild("BestTimeEvent")
-local LeastMovesEvent = ReplicatedStorage:WaitForChild("LeastMovesEvent")
+local Players = game:GetService("Players")
+local DataStoreService = game:GetService("DataStoreService")
 
-local PuzzleStart   = ReplicatedStorage:WaitForChild("PuzzleStart")
-local PuzzleInit    = ReplicatedStorage:WaitForChild("PuzzleInit")
-local RequestSlide  = ReplicatedStorage:WaitForChild("RequestSlide")
-local SlideResult   = ReplicatedStorage:WaitForChild("SlideResult")
+-- RemoteEvents
+local PuzzleStart        = ReplicatedStorage:WaitForChild("PuzzleStart")
+local ValidatedRunEvent  = ReplicatedStorage:WaitForChild("ValidatedRunEvent")
+local PuzzleInit         = ReplicatedStorage:WaitForChild("PuzzleInit")
+local RequestSlide       = ReplicatedStorage:WaitForChild("RequestSlide")
+local SlideResult        = ReplicatedStorage:WaitForChild("SlideResult")
 
-local Statistics = gui:WaitForChild("StatisticsFrame")
-local statisticsSize = Statistics:WaitForChild("StatisticsSizeLabel")
-local leaderboard = gui:WaitForChild("LeaderboardFrame")
-local leaderboardSize = leaderboard:WaitForChild("LeaderboardSizeLabel")
+local banStore = DataStoreService:GetDataStore("PuzzleGame_Bans")
 
---------------
--- VARIABLES
---------------
-local tileOrder = {}
-local tileIndex = {}        -- tile → current index
-local correctIndexMap = {}  -- tile → solved index
-local emptyIndex = 0
-local tileGrid = {}         -- tileGrid[row][col] = tile
-local tileRC = {}           -- tileRC[tile] = {row, col}
-local tileConnections = {}
+-- Active puzzle state (shared module table)
+local PuzzleState = require(game.ServerScriptService.ActivePuzzleModule)
+local activePuzzle = PuzzleState
 
-local timerRunning = false
-local elapsedTime = 0
-local moves = 0
-local inputLocked = true
-local blindfoldActive = false
-local timerId = 0
+---------------
+-- AUTOBAN (only for truly impossible states)
+---------------
+local function autoban(player, reason)
+	warn("AUTOBAN:", player.Name, reason)
 
-local pressedTile = nil
-local isTouchDevice = game:GetService("UserInputService").TouchEnabled
-local lastSlideIndex = nil
-
-local savedBestTimes = {}
-local savedBestMoves = {}
-------------
--- TIMER FUNCTIONS (visual only)
-------------
-local function stopTimer()
-	timerRunning = false
-	timerId += 1
-end
-
-local function startTimer()
-	if timerRunning then return end
-	timerRunning = true
-
-	timerId += 1
-	local thisTimer = timerId
-
-	elapsedTime = 0
-	local startTime = tick()
-
-	task.spawn(function()
-		while timerRunning and thisTimer == timerId do
-			elapsedTime = tick() - startTime
-
-			local totalSeconds = math.floor(elapsedTime)
-			local minutes = math.floor(totalSeconds / 60)
-			local seconds = totalSeconds % 60
-			local milliseconds = math.floor((elapsedTime - totalSeconds) * 1000)
-
-			timerLabel.Text = string.format("Time: %d:%02d.%03d", minutes, seconds, milliseconds)
-			task.wait(0.01)
-		end
+	pcall(function()
+		banStore:SetAsync(player.UserId, {
+			reason = reason,
+			time = os.time()
+		})
 	end)
+
+	player:Kick("You have been permanently banned for cheating.\nReason: " .. reason)
 end
 
-local function findEmptyIndex()
-	for i, tile in ipairs(tileOrder) do
-		if correctIndexMap[tile] == #tileOrder then
-			return i
+----------
+-- HELPERS
+----------
+local function sameRow(i1, i2, cols)
+	return math.ceil(i1 / cols) == math.ceil(i2 / cols)
+end
+
+local function sameColumn(i1, i2, cols)
+	return ((i1 - 1) % cols) == ((i2 - 1) % cols)
+end
+
+local function isSolved(board)
+	for i = 1, #board do
+		if board[i] ~= i then
+			return false
 		end
 	end
+	return true
 end
-
------------------
--- TILE LOCK / UNLOCK
------------------
-local function lockTiles()
-	for _, tile in ipairs(tileOrder) do
-		tile.Active = false
-		tile.AutoButtonColor = false
-	end
-end
-
-local function unlockTiles()
-	for _, tile in ipairs(tileOrder) do
-		tile.Active = true
-		tile.AutoButtonColor = false
-	end
-end
-
-----------------
--- COLOR FUNCTIONS
-----------------
-local function getRowColor(row, totalRows)
-	local hue = (row - 1) / totalRows
-	return Color3.fromHSV(hue, 0.6, 1)
-end
-
-local function getColumnColor(col, totalCols)
-	local hue = (col - 1) / totalCols
-	return Color3.fromHSV(hue, 0.6, 1)
-end
-
-local function assignFringeColors(rows, cols)
-	local tileColors = {}
-	local colorIndex = 1
-	local squareSize = math.min(rows, cols)
-
-	local function setTile(r, c, color)
-		local index = (r - 1) * cols + c
-		if not tileColors[index] then
-			tileColors[index] = color
+local function countCorrectTiles(board)
+	local correct = 0
+	for i = 1, #board - 1 do
+		if board[i] == i then
+			correct += 1
 		end
 	end
+	return correct
+end
+-------------
+-- SERVER SHUFFLE
+-------------
+local function shuffle2x2Server()
+	local rows, cols = 2, 2
+	local totalTiles = 4
 
-	if rows > cols then
-		local offset = rows - squareSize
-		for r = 1, offset do
-			local rowColor = getRowColor(colorIndex, rows * 2)
-			colorIndex += 1
-			for c = 1, cols do
-				setTile(r, c, rowColor)
-			end
-		end
-		for k = 1, squareSize do
-			local rTop = offset + k
-			local rowColor = getRowColor(colorIndex, rows * 2)
-			colorIndex += 1
-			for c = k, cols do
-				setTile(rTop, c, rowColor)
-			end
-			local colColor = getColumnColor(colorIndex, cols * 2)
-			colorIndex += 1
-			for r = rTop + 1, rows do
-				setTile(r, k, colColor)
-			end
-		end
-		return tileColors
+	-- Start solved
+	local arr = {1, 2, 3, 4}
+	local emptyIndex = 4
+
+	-- Random walk
+	local rng = Random.new()
+	local moveCount = 20
+
+	local function getValidMoves(idx)
+		local moves = {}
+		if idx > cols then table.insert(moves, idx - cols) end
+		if idx <= totalTiles - cols then table.insert(moves, idx + cols) end
+		if (idx - 1) % cols ~= 0 then table.insert(moves, idx - 1) end
+		if idx % cols ~= 0 then table.insert(moves, idx + 1) end
+		return moves
 	end
 
-	if cols > rows then
-		local offset = cols - squareSize
-		for c = 1, offset do
-			local colColor = getColumnColor(colorIndex, cols * 2)
-			colorIndex += 1
-			for r = 1, rows do
-				setTile(r, c, colColor)
-			end
-		end
-		for k = 1, squareSize do
-			local cLeft = offset + k
-			local rowColor = getRowColor(colorIndex, rows * 2)
-			colorIndex += 1
-			for c = cLeft, cols do
-				setTile(k, c, rowColor)
-			end
-			local colColor = getColumnColor(colorIndex, cols * 2)
-			colorIndex += 1
-			for r = k + 1, rows do
-				setTile(r, cLeft, colColor)
-			end
-		end
-		return tileColors
+	for i = 1, moveCount do
+		local moves = getValidMoves(emptyIndex)
+		local target = moves[rng:NextInteger(1, #moves)]
+		arr[emptyIndex], arr[target] = arr[target], arr[emptyIndex]
+		emptyIndex = target
 	end
 
-	for k = 1, squareSize do
-		local rowColor = getRowColor(colorIndex, rows * 2)
-		colorIndex += 1
-		for c = k, cols do
-			setTile(k, c, rowColor)
-		end
-		local colColor = getColumnColor(colorIndex, cols * 2)
-		colorIndex += 1
-		for r = k + 1, rows do
-			setTile(r, k, colColor)
-		end
-	end
-
-	return tileColors
+	return arr
 end
 
-local function assignTopBottom(rows, cols)
-	local tileColors = {}
-	local mid = math.floor(rows / 2)
-	local topColor = getRowColor(1, 2)
-	local bottomColor = getRowColor(2, 2)
+local function generateSolvableLayout(rows, cols)
+	if rows == 2 and cols == 2 then
+		return shuffle2x2Server()
+	end
+	local totalTiles = rows * cols
+	local g = totalTiles - 1
+	local rng = Random.new()
 
-	for r = 1, rows do
-		for c = 1, cols do
-			local index = (r - 1) * cols + c
-			tileColors[index] = (r <= mid) and topColor or bottomColor
+	while true do
+		-- build arr normally (your existing code)
+		local arr = {}
+		for i = 1, g do arr[i] = i end
+
+		local parity = false
+		for i = 1, g - 2 do
+			local t = rng:NextInteger(i, g)
+			if i ~= t then parity = not parity end
+			arr[i], arr[t] = arr[t], arr[i]
 		end
-	end
 
-	return tileColors
-end
-
-local function assignLeftRight(rows, cols)
-	local tileColors = {}
-	local mid = math.floor(cols / 2)
-	local leftColor = getColumnColor(1, 2)
-	local rightColor = getColumnColor(2, 2)
-
-	for r = 1, rows do
-		for c = 1, cols do
-			local index = (r - 1) * cols + c
-			tileColors[index] = (c <= mid) and leftColor or rightColor
+		if parity then
+			arr[g - 1], arr[g] = arr[g], arr[g - 1]
 		end
-	end
 
-	return tileColors
-end
+		table.insert(arr, totalTiles)
 
-local function assignFourCorners(rows, cols)
-	local tileColors = {}
+		-- random blank movement (your existing code)
+		local d = rng:NextInteger(0, rows - 1)
+		local r = rng:NextInteger(0, cols - 1)
+		local blankIndex = totalTiles
 
-	local midR = math.floor(rows / 2)
-	local midC = math.floor(cols / 2)
-
-	local topLeft     = getRowColor(1, 4)
-	local topRight    = getRowColor(2, 4)
-	local bottomLeft  = getRowColor(3, 4)
-	local bottomRight = getRowColor(4, 4)
-
-	for r = 1, rows do
-		for c = 1, cols do
-			local index = (r - 1) * cols + c
-			if r <= midR then
-				tileColors[index] = (c <= midC) and topLeft or topRight
-			else
-				tileColors[index] = (c <= midC) and bottomLeft or bottomRight
-			end
+		for _ = 1, d do
+			arr[blankIndex], arr[blankIndex - cols] = arr[blankIndex - cols], arr[blankIndex]
+			blankIndex -= cols
 		end
-	end
 
-	return tileColors
-end
+		for _ = 1, r do
+			arr[blankIndex], arr[blankIndex - 1] = arr[blankIndex - 1], arr[blankIndex]
+			blankIndex -= 1
+		end
 
------------------
--- PUZZLE HELPERS
------------------
-local function indexToRC(index, cols)
-	local row = math.ceil(index / cols)
-	local col = (index - 1) % cols + 1
-	return row, col
-end
+		-- minimum scramble check
+		local correct = countCorrectTiles(arr)
+		if correct <= (totalTiles / 2) then
+			return arr
+		end
 
-local function getPuzzleScale(sizeName)
-	if sizeName == "100%" then
-		return 0.97
-	elseif sizeName == "90%" then
-		return 0.90
-	elseif sizeName == "80%" then
-		return 0.80
-	elseif sizeName == "70%" then
-		return 0.70
-	elseif sizeName == "60%" then
-		return 0.60
-	elseif sizeName == "50%" then
-		return 0.50
-	elseif sizeName == "40%" then
-		return 0.40
-	end
-	return 0.90
-end
-
-local function getTextPaddingScale(sizeName)
-	if sizeName == "100%" then
-		return 0
-	elseif sizeName == "75%" then
-		return 0.125
-	elseif sizeName == "50%" then
-		return 0.25
-	elseif sizeName == "25%" then
-		return 0.375
-	end
-	return 0
-end
-
-local function rebuildGridFromOrder(rows, cols)
-	tileGrid = {}
-	tileRC = {}
-	tileIndex = {}
-
-	for i, tile in ipairs(tileOrder) do
-		local row, col = indexToRC(i, cols)
-		tileGrid[row] = tileGrid[row] or {}
-		tileGrid[row][col] = tile
-		tileRC[tile] = {row, col}
-		tileIndex[tile] = i
+		-- otherwise loop again and reshuffle
 	end
 end
 
------------------
--- BLINDFOLD RESTORE (visual only)
------------------
-local function restoreBlindfold()
-	if not blindfoldActive then return end
-
-	local rows = rowsValue.Value
-	local cols = colsValue.Value
-
-	local patternColors = nil
-	local mode = colorpatternMode.Value
-
-	if mode == "Fringe" then
-		patternColors = assignFringeColors(rows, cols)
-	elseif mode == "Top/Bottom" then
-		patternColors = assignTopBottom(rows, cols)
-	elseif mode == "Left/Right" then
-		patternColors = assignLeftRight(rows, cols)
-	elseif mode == "4 Corners" then
-		patternColors = assignFourCorners(rows, cols)
+------------
+-- SLIDE LOGIC
+------------
+local function computeSlide(board, clickedIndex, emptyIndex, rows, cols)
+	if clickedIndex == emptyIndex then
+		return board, emptyIndex, 0
 	end
 
-	for i, tile in ipairs(tileOrder) do
-		local isBlank = (tile.Text == "" and tile.BackgroundTransparency == 1)
-		if isBlank then
-			continue
-		end
-
-		local correct = correctIndexMap[tile]
-		local row = math.ceil(correct / cols)
-		local col = ((correct - 1) % cols) + 1
-
-		if puzzleModeValue.Value == "Numbers" then
-			local num = tonumber(tile.Name:match("%d+"))
-			tile.Text = tostring(num)
-		else
-			tile.Text = ""
-		end
-
-		if puzzleModeValue.Value == "Images" and selectedImageIdValue.Value ~= "" then
-			local img = tile:FindFirstChildOfClass("ImageLabel")
-			if not img then
-				img = Instance.new("ImageLabel")
-				img.Parent = tile
-				img.Size = UDim2.fromScale(1, 1)
-				img.BackgroundTransparency = 1
-				img.BorderSizePixel = 0
-				img.Active = false
-			end
-
-			img.Image = "rbxassetid://" .. selectedImageIdValue.Value
-			img.ScaleType = Enum.ScaleType.Crop
-
-			local sliceW = 1024 / cols
-			local sliceH = 1024 / rows
-
-			img.ImageRectSize = Vector2.new(sliceW, sliceH)
-			img.ImageRectOffset = Vector2.new(
-				(col - 1) * sliceW,
-				(row - 1) * sliceH
-			)
-		else
-			local img = tile:FindFirstChildOfClass("ImageLabel")
-			if img then img:Destroy() end
-		end
-
-		if mode == "Rows" then
-			tile.BackgroundColor3 = getRowColor(row, rows)
-		elseif mode == "Columns" then
-			tile.BackgroundColor3 = getColumnColor(col, cols)
-		elseif patternColors then
-			tile.BackgroundColor3 = patternColors[correct]
-		else
-			tile.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-		end
-
-		tile.BackgroundTransparency = 0
-		tile.BorderSizePixel = 0
+	if not (sameRow(clickedIndex, emptyIndex, cols) or sameColumn(clickedIndex, emptyIndex, cols)) then
+		return nil, nil, nil
 	end
 
-	blindfoldActive = false
+	local direction = clickedIndex > emptyIndex and 1 or -1
+	local step = sameRow(clickedIndex, emptyIndex, cols) and 1 or cols
+
+	local current = emptyIndex
+	local swaps = {}
+
+	while current ~= clickedIndex do
+		local nextIndex = current + step * direction
+		table.insert(swaps, {from = current, to = nextIndex})
+		current = nextIndex
+	end
+
+	for _, s in ipairs(swaps) do
+		board[s.from], board[s.to] = board[s.to], board[s.from]
+	end
+
+	local movedCount = math.abs(clickedIndex - emptyIndex) / step
+	return board, clickedIndex, movedCount
 end
 
-----------------
--- BUILD PUZZLE (UI only, starts solved)
-----------------
-local function buildPuzzle(rows, cols)
-	for _, child in ipairs(board:GetChildren()) do
-		if child:IsA("TextButton") then
-			child:Destroy()
-		end
+--------------
+-- PUZZLE START
+--------------
+PuzzleStart.OnServerEvent:Connect(function(player, rows, cols, puzzleMode, blindfoldEnabled)
+	-- Basic validation
+	if typeof(rows) ~= "number" or typeof(cols) ~= "number" then return end
+	if rows < 2 or cols < 2 then
+		autoban(player, "Invalid puzzle dimensions (too small)")
+		return
 	end
 
-	tileOrder = {}
-	tileIndex = {}
-	correctIndexMap = {}
-	tileGrid = {}
-	tileRC = {}
+	if rows > 30 or cols > 30 then
+		autoban(player, "Invalid puzzle dimensions (too large)")
+		return
+	end
+	if typeof(puzzleMode) ~= "string" then return end
+	if typeof(blindfoldEnabled) ~= "boolean" then return end
 
+	local layout = generateSolvableLayout(rows, cols)
 	local totalTiles = rows * cols
 
-	local camera = workspace.CurrentCamera
-	local screenH = camera.ViewportSize.Y
-
-	local scale = getPuzzleScale(settingsFrame.PuzzleSize.Value)
-	local baseSize = screenH * scale
-
-	local puzzleW, puzzleH
-	if rows == cols then
-		puzzleW, puzzleH = baseSize, baseSize
-	elseif cols > rows then
-		puzzleW = baseSize
-		puzzleH = baseSize * (rows / cols)
-	else
-		puzzleH = baseSize
-		puzzleW = baseSize * (cols / rows)
-	end
-
-	puzzleW = math.floor(puzzleW / cols) * cols
-	puzzleH = math.floor(puzzleH / rows) * rows
-
-	board.Size = UDim2.fromOffset(puzzleW, puzzleH)
-
-	local patternColors = nil
-	local mode = colorpatternMode.Value
-
-	if mode == "Fringe" then
-		patternColors = assignFringeColors(rows, cols)
-	elseif mode == "Top/Bottom" then
-		patternColors = assignTopBottom(rows, cols)
-	elseif mode == "Left/Right" then
-		patternColors = assignLeftRight(rows, cols)
-	elseif mode == "4 Corners" then
-		patternColors = assignFourCorners(rows, cols)
-	end
-
-	local textPaddingScale = getTextPaddingScale(settingsFrame.TextSize.Value)
-
+	local emptyIndex
 	for i = 1, totalTiles do
-		local tile = Instance.new("TextButton")
-		tile.Name = "Tile" .. i
-		tile.Parent = board
-		tile.LayoutOrder = i
-		tile.TextScaled = true
-		tile.Font = Enum.Font.GothamBold
-		tile.BorderSizePixel = 0
-		tile.AutoButtonColor = false
-
-		local row = math.ceil(i / cols)
-		local col = ((i - 1) % cols) + 1
-
-		tileGrid[row] = tileGrid[row] or {}
-		tileGrid[row][col] = tile
-		tileRC[tile] = {row, col}
-
-		correctIndexMap[tile] = i
-		tileOrder[i] = tile
-		tileIndex[tile] = i
-
-		if i == totalTiles then
-			tile.Text = ""
-			tile.BackgroundTransparency = 1
-			tile.Active = false
-		elseif puzzleModeValue.Value == "Numbers" then
-			tile.Text = tostring(i)
-
-			local padding = Instance.new("UIPadding")
-			padding.Parent = tile
-			padding.PaddingTop = UDim.new(textPaddingScale, 0)
-			padding.PaddingBottom = UDim.new(textPaddingScale, 0)
-			padding.PaddingLeft = UDim.new(textPaddingScale, 0)
-			padding.PaddingRight = UDim.new(textPaddingScale, 0)
-
-			if mode == "Rows" then
-				tile.BackgroundColor3 = getRowColor(row, rows)
-			elseif mode == "Columns" then
-				tile.BackgroundColor3 = getColumnColor(col, cols)
-			elseif patternColors then
-				tile.BackgroundColor3 = patternColors[i]
-			else
-				tile.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-			end
-		elseif puzzleModeValue.Value == "Images"
-			and selectedImageIdValue.Value ~= "" then
-
-			tile.Text = ""
-			tile.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-
-			local img = Instance.new("ImageLabel")
-			img.Parent = tile
-			img.Size = UDim2.fromScale(1, 1)
-			img.BackgroundTransparency = 1
-			img.BorderSizePixel = 0
-			img.Active = false
-			img.Image = "rbxassetid://" .. selectedImageIdValue.Value
-
-			local sliceW = 1024 / cols
-			local sliceH = 1024 / rows
-
-			img.ImageRectSize = Vector2.new(sliceW, sliceH)
-			img.ImageRectOffset = Vector2.new(
-				(col - 1) * sliceW,
-				(row - 1) * sliceH
-			)
-		end
-
-		local aspect = Instance.new("UIAspectRatioConstraint")
-		aspect.AspectRatio = 1
-		aspect.Parent = tile
-	end
-
-	emptyIndex = findEmptyIndex()
-
-	local grid = board:FindFirstChildOfClass("UIGridLayout")
-	if not grid then
-		grid = Instance.new("UIGridLayout")
-		grid.Parent = board
-	end
-
-	grid.FillDirection = Enum.FillDirection.Horizontal
-	grid.HorizontalAlignment = Enum.HorizontalAlignment.Center
-	grid.VerticalAlignment = Enum.VerticalAlignment.Center
-	grid.SortOrder = Enum.SortOrder.LayoutOrder
-	grid.CellPadding = UDim2.new(0, 0, 0, 0)
-	grid.CellSize = UDim2.new(1 / cols, 0, 1 / rows, 0)
-
-	for _, tile in ipairs(tileOrder) do
-		tileConnections[tile] = {}
-
-		local con1 = tile.InputBegan:Connect(function(input)
-			if input.UserInputType == Enum.UserInputType.MouseButton1 then
-				pressedTile = tile
-			end
-		end)
-
-		local con2 = tile.MouseEnter:Connect(function()
-			if slidingModeValue.Value and not inputLocked then
-				local idx = tileIndex[tile]
-				if idx and idx ~= lastSlideIndex then
-					lastSlideIndex = idx
-					RequestSlide:FireServer(idx)
-				end
-			end
-		end)
-
-		table.insert(tileConnections[tile], con1)
-		table.insert(tileConnections[tile], con2)
-	end
-
-	lockTiles()
-end
-
-----------------
--- PROCESS TILE (now just sends RequestSlide)
-----------------
-local function processTile(tile)
-	if inputLocked then return end
-	local index = tileIndex[tile]
-	if not index then return end
-	RequestSlide:FireServer(index)
-end
-
-----------------
--- INPUT HANDLING
-----------------
-local UIS = game:GetService("UserInputService")
-local GuiService = game:GetService("GuiService")
-
-UIS.InputEnded:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.MouseButton1 then
-		if pressedTile and not slidingModeValue.Value then
-			processTile(pressedTile)
-		end
-		pressedTile = nil
-		return
-	end
-
-	if input.UserInputType == Enum.UserInputType.Touch then
-		if pressedTile and not slidingModeValue.Value then
-			processTile(pressedTile)
-		end
-		pressedTile = nil
-		return
-	end
-
-	if input.KeyCode == Enum.KeyCode.ButtonA then
-		local selected = GuiService.SelectedObject
-		if selected and tileIndex[selected] and not slidingModeValue.Value then
-			processTile(selected)
-		end
-	end
-end)
-
-if isTouchDevice then
-	UIS.TouchStarted:Connect(function(touch)
-		local pos = touch.Position
-		local guiRoot = game:GetService("Players").LocalPlayer.PlayerGui
-		local objs = guiRoot:GetGuiObjectsAtPosition(pos.X, pos.Y)
-
-		for _, obj in ipairs(objs) do
-			if tileIndex[obj] then
-				pressedTile = obj
-				break
-			end
-		end
-	end)
-end
-
-----------------
--- RELAYOUT (size / padding)
-----------------
-local function relayoutPuzzle()
-	task.wait(0.1)
-
-	local rows = rowsValue.Value
-	local cols = colsValue.Value
-
-	local camera = workspace.CurrentCamera
-	local viewport = camera.ViewportSize
-	local screenH = viewport.Y
-
-	local scale = getPuzzleScale(settingsFrame.PuzzleSize.Value)
-	local baseSize = screenH * scale
-
-	local puzzleW
-	local puzzleH
-
-	if rows == cols then
-		puzzleW = baseSize
-		puzzleH = baseSize
-	elseif cols > rows then
-		puzzleW = baseSize
-		puzzleH = baseSize * (rows / cols)
-	else
-		puzzleH = baseSize
-		puzzleW = baseSize * (cols / rows)
-	end
-
-	puzzleW = math.floor(puzzleW / cols) * cols
-	puzzleH = math.floor(puzzleH / rows) * rows
-
-	board.Size = UDim2.fromOffset(puzzleW, puzzleH)
-
-	local textPaddingScale = getTextPaddingScale(settingsFrame.TextSize.Value)
-
-	for _, tile in ipairs(board:GetChildren()) do
-		if tile:IsA("TextButton") then
-			local isImageTile = (tile.Text == "" and tile:FindFirstChildOfClass("ImageLabel") ~= nil)
-
-			if not isImageTile then
-				local padding = tile:FindFirstChildOfClass("UIPadding")
-				if not padding then
-					padding = Instance.new("UIPadding")
-					padding.Parent = tile
-				end
-
-				padding.PaddingTop = UDim.new(textPaddingScale, 0)
-				padding.PaddingBottom = UDim.new(textPaddingScale, 0)
-				padding.PaddingLeft = UDim.new(textPaddingScale, 0)
-				padding.PaddingRight = UDim.new(textPaddingScale, 0)
-			else
-				local padding = tile:FindFirstChildOfClass("UIPadding")
-				if padding then padding:Destroy() end
-			end
-		end
-	end
-end
-
-gui:GetPropertyChangedSignal("AbsoluteSize"):Connect(relayoutPuzzle)
-settingsFrame.PuzzleSize.Changed:Connect(relayoutPuzzle)
-settingsFrame.TextSize.Changed:Connect(relayoutPuzzle)
-
-----------------
--- COLOR PATTERN CHANGE
-----------------
-colorpatternMode.Changed:Connect(function()
-	local rows = rowsValue.Value
-	local cols = colsValue.Value
-	local mode = colorpatternMode.Value
-
-	local patternColors = nil
-	if mode == "Fringe" then
-		patternColors = assignFringeColors(rows, cols)
-	elseif mode == "Top/Bottom" then
-		patternColors = assignTopBottom(rows, cols)
-	elseif mode == "Left/Right" then
-		patternColors = assignLeftRight(rows, cols)
-	elseif mode == "4 Corners" then
-		patternColors = assignFourCorners(rows, cols)
-	end
-
-	for _, tile in ipairs(tileOrder) do
-		if tile.Text ~= "" then
-			local correct = correctIndexMap[tile]
-			local row = math.ceil(correct / cols)
-			local col = ((correct - 1) % cols) + 1
-
-			if mode == "Rows" then
-				tile.BackgroundColor3 = getRowColor(row, rows)
-			elseif mode == "Columns" then
-				tile.BackgroundColor3 = getColumnColor(col, cols)
-			elseif patternColors then
-				tile.BackgroundColor3 = patternColors[correct]
-			else
-				tile.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-			end
-		end
-	end
-end)
-
-----------------
--- BEST TIME / MOVES UI
-----------------
-local function formatTime(t)
-	if not t then
-		return "Best Time: --:--.--"
-	end
-
-	local totalSeconds = math.floor(t)
-	local minutes = math.floor(totalSeconds / 60)
-	local seconds = totalSeconds % 60
-	local centi = math.floor((t - totalSeconds) * 100)
-
-	return string.format("Best Time: %d:%02d.%02d", minutes, seconds, centi)
-end
-
-local function formatMoves(m)
-	if not m then
-		return "Least Moves: --"
-	end
-	return "Least Moves: " .. m
-end
-
-bestTimeEvent.OnClientEvent:Connect(function(allTimes)
-	savedBestTimes = allTimes or {}
-
-	local rows = rowsValue.Value
-	local cols = colsValue.Value
-	local key = tostring(rows) .. "x" .. tostring(cols)
-
-	BestTimeLabel.Text = formatTime(savedBestTimes[key])
-end)
-
-LeastMovesEvent.OnClientEvent:Connect(function(allMoves)
-	savedBestMoves = allMoves or {}
-
-	local rows = rowsValue.Value
-	local cols = colsValue.Value
-	local key = tostring(rows) .. "x" .. tostring(cols)
-
-	LeastAmountofMovesLabel.Text = formatMoves(savedBestMoves[key])
-end)
-
-----------------
--- REBUILD PUZZLE WHEN SETTINGS CHANGE
-----------------
-local function rebuild()
-	task.wait(0.1)
-
-	local lastSize = gui.AbsoluteSize
-	for i = 1, 20 do
-		task.wait(0.1)
-		if gui.AbsoluteSize == lastSize then
+		if layout[i] == totalTiles then
+			emptyIndex = i
 			break
 		end
-		lastSize = gui.AbsoluteSize
 	end
 
-	local rows = rowsValue.Value
-	local cols = colsValue.Value
-
-	buildPuzzle(rows, cols)
-
-	inputLocked = true
-	timerRunning = false
-	elapsedTime = 0
-	moves = 0
-
-	timerLabel.Text = "Time: 0:00.00"
-	movesLabel.Text = "Moves: 0"
-	sizeLabel.Text = "Size: " .. rows .. "x" .. cols
-	statisticsSize.Text = rows .. "x" .. cols
-	leaderboardSize.Text = rows .. "x" .. cols
-
-	local key = tostring(rows) .. "x" .. tostring(cols)
-	BestTimeLabel.Text = formatTime(savedBestTimes[key]) -- nil with 10x10
-	LeastAmountofMovesLabel.Text = formatMoves(savedBestMoves[key])
-end
-
-rowsValue.Changed:Connect(rebuild)
-colsValue.Changed:Connect(rebuild)
-puzzleModeValue.Changed:Connect(rebuild)
-selectedImageIdValue.Changed:Connect(rebuild)
-
-----------------
--- DESTROY PUZZLE ON GUI DISABLE
-----------------
-local function destroyPuzzle()
-	if timerRunning then
-		stopTimer()
+	-- This should never fail; if it does, it's server-side
+	if not emptyIndex then
+		warn("Internal error: No blank tile in generated layout for", player.Name)
+		return
 	end
 
-	for tile, conns in pairs(tileConnections) do
-		for _, conn in ipairs(conns) do
-			conn:Disconnect()
-		end
-	end
+	-- Overwrite any previous puzzle safely
+	activePuzzle[player] = {
+		rows = rows,
+		cols = cols,
+		mode = puzzleMode,
+		blindfold = blindfoldEnabled,
+		startTime = blindfoldEnabled and tick() or 0,
+		completed = false,
+		board = layout,
+		emptyIndex = emptyIndex,
+		moves = 0,
+	}
 
-	tileConnections = {}
-
-	for _, child in ipairs(board:GetChildren()) do
-		if child:IsA("TextButton") then
-			child:Destroy()
-		end
-	end
-
-	tileOrder = {}
-	tileIndex = {}
-	correctIndexMap = {}
-	tileGrid = {}
-	tileRC = {}
-	emptyIndex = nil
-end
-
-gui:GetPropertyChangedSignal("Enabled"):Connect(function()
-	if gui.Enabled == false then
-		destroyPuzzle()
-	else
-		rebuild()
-	end
+	-- Client builds board in solved order, then applies layout
+	PuzzleInit:FireClient(player, rows, cols, layout)
 end)
 
-----------------
--- SERVER EVENTS: APPLY LAYOUT & MOVES
-----------------
-PuzzleInit.OnClientEvent:Connect(function(rows, cols, layout)
-	-- Build fresh puzzle UI
-	buildPuzzle(rows, cols)
+------
+-- REQUEST SLIDE
+------
+local HttpService = game:GetService("HttpService")
 
-	-- Apply server layout
-	for pos, tileValue in ipairs(layout) do
-		local tile = board:FindFirstChild("Tile" .. tileValue)
-		if tile then
-			tile.LayoutOrder = pos
+RequestSlide.OnServerEvent:Connect(function(player, clickedIndex)
+	local active = activePuzzle[player]
+
+	-- Desync or manual firing: ignore, no autoban
+	if not active then
+		return
+	end
+
+	-- Puzzle already completed: ignore further moves
+	if active.completed then
+		return
+	end
+
+	-- Basic type validation
+	if typeof(clickedIndex) ~= "number" then
+		warn(player.Name, "sent RequestSlide with non-number index")
+		return
+	end
+
+	local rows = active.rows
+	local cols = active.cols
+	local totalTiles = rows * cols
+
+	-- Range validation
+	if clickedIndex < 1 or clickedIndex > totalTiles then
+		warn(player.Name, "sent RequestSlide out-of-range index", clickedIndex)
+		return
+	end
+
+	-- Clone board to avoid race conditions
+	local function cloneBoard(board)
+		local new = {}
+		for i, v in ipairs(board) do
+			new[i] = v
 		end
+		return new
 	end
 
-	table.sort(tileOrder, function(a, b)
-		return a.LayoutOrder < b.LayoutOrder
-	end)
+	local board = cloneBoard(active.board)
+	local emptyIndex = active.emptyIndex
 
-	rebuildGridFromOrder(rows, cols)
-	emptyIndex = findEmptyIndex()
+	-- Compute slide
+	local newBoard, newEmptyIndex, movedCount =
+		computeSlide(board, clickedIndex, emptyIndex, rows, cols)
 
-	inputLocked = false
-	unlockTiles()
-	moves = 0
-	if not blindfoldedModeValue.Value then
-		timerRunning = false
-		elapsedTime = 0
-		timerLabel.Text = "Time: 0:00.00"
-	else
-		-- Blindfold mode: timer already started on shuffle
-		timerRunning = true
-	end
-end)
-
-SlideResult.OnClientEvent:Connect(function(newBoard, movedCount, newEmptyIndex, newMoves, solved)
-	local rows = rowsValue.Value
-	local cols = colsValue.Value
-
-	-- Update layout from server board array
-	for pos, tileValue in ipairs(newBoard) do
-		local tile = board:FindFirstChild("Tile" .. tileValue)
-		if tile then
-			tile.LayoutOrder = pos
-		end
+	-- Illegal move: ignore
+	if not newBoard then
+		return
 	end
 
-	table.sort(tileOrder, function(a, b)
-		return a.LayoutOrder < b.LayoutOrder
-	end)
-
-	rebuildGridFromOrder(rows, cols)
-
-	emptyIndex = newEmptyIndex
-	moves = newMoves
-	movesLabel.Text = "Moves: " .. moves
-
-	-- Start timer on first move (visual)
-	if moves > 0 and not timerRunning then
-		startTimer()
+	-- Start timer on first REAL move (non-blindfold)
+	if not active.blindfold and active.moves == 0 and movedCount > 0 then
+		active.startTime = tick()
 	end
 
-	-- Blindfold: hide tiles on first move
-	if blindfoldedModeValue.Value and moves == movedCount and movedCount > 0 and not blindfoldActive then
-		blindfoldActive = true
-		for _, tile in ipairs(tileOrder) do
-			local isBlank = (tile.Text == "" and tile.BackgroundTransparency == 1)
-			if not isBlank then
-				tile.Text = ""
-				local img = tile:FindFirstChildOfClass("ImageLabel")
-				if img then img:Destroy() end
-				tile.BackgroundColor3 = Color3.fromRGB(255, 93, 93)
-				tile.BorderMode = Enum.BorderMode.Inset
-				tile.BorderSizePixel = 1
-				tile.BorderColor3 = Color3.fromRGB(0, 0, 0)
+	-- Commit new state
+	active.board = newBoard
+	active.emptyIndex = newEmptyIndex
+	active.moves += movedCount
+
+	local solved = isSolved(newBoard)
+	local bypass = (totalTiles < 16)
+
+	if solved and not active.completed then
+		-- EXTRA SECURITY: verify board integrity before accepting solve
+		for i = 1, totalTiles do
+			if active.board[i] ~= i then
+				autoban(player, "Client reported solved but server board is not solved")
+				return
 			end
 		end
+
+		active.completed = true
+
+		local solveTime = tick() - active.startTime
+		local moves = active.moves
+		-- Fix: 0-move solves should not add huge time
+		if moves == 0 then
+			solveTime = 0
+		end
+		-- Only autoban for truly impossible states
+		if not bypass then
+			if solveTime < 0 then
+				autoban(player, "Negative solve time")
+				return
+			end
+			if moves < 0 then
+				autoban(player, "Negative moves")
+				return
+			end
+			if totalTiles >= 16 and moves < 1 then
+				autoban(player, "Solved puzzle with zero moves above 16 tiles")
+				return
+			end
+			-- Slightly safer threshold; you can tune this
+			if totalTiles >= 16 and solveTime < 0.1 then
+				autoban(player, "Solve time impossibly fast")
+				return
+			end
+		end
+
+		-- Generate secure run token
+		active.runToken = HttpService:GenerateGUID(false)
+
+		-- Report validated run WITH token
+		ValidatedRunEvent:Fire(
+			player,
+			rows,
+			cols,
+			solveTime,
+			moves,
+			active.mode,
+			active.blindfold,
+			active.runToken
+		)
+
+		-- Clear puzzle state after a short delay to avoid race with client
+		task.delay(0.2, function()
+			activePuzzle[player] = nil
+		end)
 	end
 
-	if solved then
-		stopTimer()
-		inputLocked = true
-		lockTiles()
-	end
+	-- Always tell client the result of this move
+	SlideResult:FireClient(
+		player,
+		newBoard,
+		movedCount,
+		active.emptyIndex,
+		active.moves,
+		solved
+	)
 end)
 
-----------------
--- INITIALIZE + SHUFFLE BUTTON
-----------------
-rebuild()
-
-local shuffleEvent = gui:WaitForChild("ShuffleEvent")
-shuffleEvent.Event:Connect(function()
-	local rows = rowsValue.Value
-	local cols = colsValue.Value
-
-	-- Reset blindfold state
-	blindfoldActive = false
-
-	-- Always reset timer on shuffle
-	timerRunning = false
-	elapsedTime = 0
-	timerLabel.Text = "Time: 0:00.00"
-
-	PuzzleStart:FireServer(rows, cols, puzzleModeValue.Value, blindfoldedModeValue.Value)
-
-	-- Blindfold mode: start timer immediately
-	if blindfoldedModeValue.Value then
-		startTimer()
-	end
-end)
-
-blindfoldedModeValue.Changed:Connect(function()
-	rebuild()
-
-	-- Prevent moves until the player shuffles again
-	inputLocked = true
-	lockTiles()
-
-	-- Reset blindfold state so next run hides tiles correctly
-	blindfoldActive = false
-	moves = 0
-	timerRunning = false
-	elapsedTime = 0
-	timerLabel.Text = "Time: 0:00.00"
-
-	-- DO NOT call PuzzleStart here
-	-- DO NOT start the timer here
-
-	-- Player must press Shuffle to begin a new blindfold run
+-----
+-- CLEANUP
+-----
+Players.PlayerRemoving:Connect(function(player)
+	activePuzzle[player] = nil
 end)
