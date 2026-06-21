@@ -177,12 +177,6 @@ local function computeSlide(board, clickedIndex, emptyIndex, rows, cols)
 end
 
 --------------
--- RATE LIMITING
---------------
-local lastMove = {}
-local MOVE_COOLDOWN = 0.02
-
---------------
 -- PUZZLE START
 --------------
 PuzzleStart.OnServerEvent:Connect(function(player, rows, cols, puzzleMode, blindfoldEnabled)
@@ -193,7 +187,7 @@ PuzzleStart.OnServerEvent:Connect(function(player, rows, cols, puzzleMode, blind
 		return
 	end
 
-	if rows > 50 or cols > 50 then
+	if rows > 30 or cols > 30 then
 		autoban(player, "Invalid puzzle dimensions (too large)")
 		return
 	end
@@ -268,13 +262,6 @@ RequestSlide.OnServerEvent:Connect(function(player, clickedIndex)
 		return
 	end
 
-	-- Rate limit moves (slightly safer cooldown)
-	local now = tick()
-	if lastMove[player] and now - lastMove[player] < MOVE_COOLDOWN then
-		return
-	end
-	lastMove[player] = now
-
 	-- Clone board to avoid race conditions
 	local function cloneBoard(board)
 		local new = {}
@@ -322,7 +309,10 @@ RequestSlide.OnServerEvent:Connect(function(player, clickedIndex)
 
 		local solveTime = tick() - active.startTime
 		local moves = active.moves
-
+		-- Fix: 0-move solves should not add huge time
+		if moves == 0 then
+			solveTime = 0
+		end
 		-- Only autoban for truly impossible states
 		if not bypass then
 			if solveTime < 0 then
@@ -362,7 +352,6 @@ RequestSlide.OnServerEvent:Connect(function(player, clickedIndex)
 		-- Clear puzzle state after a short delay to avoid race with client
 		task.delay(0.2, function()
 			activePuzzle[player] = nil
-			lastMove[player] = nil
 		end)
 	end
 
@@ -382,5 +371,4 @@ end)
 -----
 Players.PlayerRemoving:Connect(function(player)
 	activePuzzle[player] = nil
-	lastMove[player] = nil
 end)
